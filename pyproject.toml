@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synthetic-data-factory"
+version = "0.1.0"
+description = "Generate realistic synthetic datasets: schema-driven tabular data with referential integrity, plus LLM-generated text and Q&A on free NVIDIA NIM."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alejandro Brito" }]
+keywords = ["synthetic-data", "test-data", "fine-tuning", "nvidia-nim", "faker", "data-generation"]
+dependencies = [
+    "PyYAML>=6.0",
+    "pandas>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=14.0"]
+llm = ["openai>=1.30", "python-dotenv>=1.0"]
+dev = ["pytest>=7.4", "pyarrow>=14.0", "openai>=1.30", "python-dotenv>=1.0"]
+
+[project.scripts]
+sdf = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

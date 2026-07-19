@@ -1,0 +1,41 @@
+# Text-generation task (needs NVIDIA_API_KEY).
+#
+#   python cli.py generate text --task schemas/text-task.yaml \
+#       --out results/reviews.jsonl --chat results/reviews.chat.jsonl
+#
+# task: one of  reviews | classification | personas | tickets | paraphrase
+task: reviews
+seed: 7
+temperature: 0.95
+
+# --- reviews-specific ------------------------------------------------------
+product: wireless noise-cancelling headphones
+count: 24
+sentiments:            # controlled sentiment mix; weights need not sum to 1
+  positive: 0.5
+  neutral: 0.2
+  negative: 0.3
+
+# ---------------------------------------------------------------------------
+# Other task shapes (swap `task:` and uncomment the matching block):
+#
+# task: classification
+# labels: [billing, technical, account, feedback]
+# per_class: 12
+# domain: short customer support messages for a SaaS app
+#
+# task: personas
+# count: 20
+# context: B2B SaaS early adopters and IT admins in Latin America
+#
+# task: tickets
+# categories: [login, billing, bug, feature_request]
+# per_category: 8
+# product: a project-management web app
+#
+# task: paraphrase
+# variations: 5
+# seeds:
+#   - How do I reset my password?
+#   - Where can I download my invoice?
+#   - Can I change my subscription plan?

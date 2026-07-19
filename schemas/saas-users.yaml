@@ -1,0 +1,104 @@
+# SaaS product analytics: accounts -> users -> events.
+# Exercises datetime fields, an exponential-distributed duration, a boolean
+# with a controlled true-rate, and MRR correlated with seat count.
+seed: 2024
+
+tables:
+  - name: accounts
+    rows: 300
+    fields:
+      - name: account_id
+        type: id
+        prefix: "acct_"
+        start: 1
+      - name: company
+        type: company
+      - name: plan
+        type: category
+        categories:
+          free: 0.55
+          pro: 0.30
+          enterprise: 0.15
+      - name: seats
+        type: int
+        min: 1
+        max: 250
+        distribution: exponential
+        scale: 20
+      - name: mrr
+        type: float
+        min: 0
+        max: 12000
+        round: 2
+        correlate:
+          field: seats
+          strength: 0.85
+      - name: region
+        type: category
+        categories:
+          NA: 0.4
+          LATAM: 0.25
+          EU: 0.25
+          APAC: 0.10
+      - name: created_at
+        type: datetime
+        start: 2022-01-01
+        end: 2024-12-31
+
+  - name: users
+    rows: 1500
+    fields:
+      - name: user_id
+        type: id
+        prefix: "usr_"
+        start: 1
+      - name: account_id
+        type: foreign_key
+        references: accounts.account_id
+      - name: full_name
+        type: name
+      - name: email
+        type: email
+        depends_on: full_name
+        unique: true
+      - name: role
+        type: category
+        categories:
+          member: 0.7
+          admin: 0.2
+          owner: 0.1
+      - name: is_active
+        type: bool
+        true_rate: 0.8
+      - name: last_login
+        type: datetime
+        start: 2024-06-01
+        end: 2024-12-31
+
+  - name: events
+    rows: 8000
+    fields:
+      - name: event_id
+        type: id
+        start: 1
+      - name: user_id
+        type: foreign_key
+        references: users.user_id
+      - name: event_type
+        type: category
+        categories:
+          page_view: 0.5
+          feature_used: 0.25
+          export: 0.1
+          invite_sent: 0.08
+          error: 0.07
+      - name: duration_ms
+        type: int
+        min: 5
+        max: 60000
+        distribution: exponential
+        scale: 1500
+      - name: ts
+        type: datetime
+        start: 2024-06-01
+        end: 2024-12-31

@@ -1,0 +1,14 @@
+# --- Core (tabular path — zero API needed) ---------------------------------
+PyYAML>=6.0            # schema.yaml parsing
+pandas>=2.0           # dataframes, csv/parquet/sqlite export
+numpy>=1.24           # correlation math, embedding cosine similarity
+
+# --- Export targets --------------------------------------------------------
+pyarrow>=14.0         # parquet export (optional at runtime; import guarded)
+
+# --- LLM path (text + qa generators) ---------------------------------------
+openai>=1.30          # OpenAI-compatible client, pointed at NVIDIA NIM
+python-dotenv>=1.0    # load NVIDIA_API_KEY from .env
+
+# --- Dev / tests -----------------------------------------------------------
+pytest>=7.4

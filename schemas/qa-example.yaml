@@ -1,0 +1,26 @@
+# Q&A / instruction-pair task from seed documents (needs NVIDIA_API_KEY).
+#
+#   python cli.py generate qa --task schemas/qa-example.yaml \
+#       --out results/qa.jsonl --chat results/qa.chat.jsonl --with-context
+#
+task: qa
+seed: 11
+temperature: 0.7
+
+questions_per_chunk: 2
+chunk_size: 220          # words per chunk
+overlap: 40             # word overlap between chunks
+hard_negatives: true    # emit a plausible-but-wrong answer per pair
+min_quality: 4          # keep pairs scoring >= 4 on all three axes (1..5)
+
+# Documents can be inline strings, {text: ...}, or {path: ...} (relative to
+# this file). Paths let you point at your own knowledge base.
+docs:
+  - path: ../examples/seed_docs/refund_policy.md
+  - path: ../examples/seed_docs/shipping_policy.md
+  - text: >
+      The Pro plan includes unlimited projects, priority email support with a
+      one business day response target, and single sign-on via SAML. The Free
+      plan is limited to three active projects and community support only.
+      Annual billing saves two months compared to paying monthly.
+    source: plans-blurb

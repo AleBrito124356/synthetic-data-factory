@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated output (this repo writes datasets here)
+results/
+out/
+output/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,102 @@
+# Healthcare-flavored dataset: patients -> encounters.
+#
+# IMPORTANT: this is entirely SYNTHETIC. It contains no real patient data and
+# is not PHI. It uses a documentation-style MRN prefix and fictional values.
+# Use it for schema demos, pipeline tests, and load testing only.
+seed: 777
+
+description: Synthetic patient encounters for testing. No real PHI.
+
+tables:
+  - name: patients
+    rows: 400
+    fields:
+      - name: patient_uuid
+        type: uuid
+      - name: mrn
+        type: id
+        prefix: "MRN-"
+        start: 100000
+      - name: full_name
+        type: name
+      - name: birth_date
+        type: date
+        start: 1940-01-01
+        end: 2010-12-31
+      - name: sex
+        type: category
+        categories:
+          F: 0.51
+          M: 0.49
+      - name: blood_type
+        type: category
+        categories:
+          "O+": 0.37
+          "A+": 0.30
+          "B+": 0.15
+          "AB+": 0.05
+          "O-": 0.06
+          "A-": 0.04
+          "B-": 0.02
+          "AB-": 0.01
+      - name: bmi
+        type: float
+        min: 15
+        max: 45
+        round: 1
+        distribution: normal
+        mean: 27
+        std: 5
+      - name: region
+        type: category
+        categories:
+          Panama: 0.5
+          Colon: 0.15
+          Chiriqui: 0.15
+          Veraguas: 0.1
+          Other: 0.1
+
+  - name: encounters
+    rows: 1200
+    fields:
+      - name: encounter_id
+        type: id
+        prefix: "ENC-"
+        start: 1
+      - name: patient_uuid
+        type: foreign_key
+        references: patients.patient_uuid
+      - name: encounter_date
+        type: date
+        start: 2023-01-01
+        end: 2024-12-31
+      - name: department
+        type: category
+        categories:
+          emergency: 0.3
+          cardiology: 0.15
+          pediatrics: 0.15
+          orthopedics: 0.15
+          general: 0.25
+      - name: triage_level
+        type: category
+        categories:
+          "1": 0.05
+          "2": 0.15
+          "3": 0.40
+          "4": 0.30
+          "5": 0.10
+      - name: length_of_stay_days
+        type: int
+        min: 0
+        max: 21
+        distribution: exponential
+        scale: 3
+      - name: total_cost
+        type: float
+        min: 100
+        max: 40000
+        round: 2
+        correlate:
+          field: length_of_stay_days
+          strength: 0.8

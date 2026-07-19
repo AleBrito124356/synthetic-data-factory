@@ -1,0 +1,133 @@
+# E-commerce dataset: customers -> orders -> order_items, plus a products
+# catalog. Exercises foreign keys across three levels, weighted categoricals,
+# a name-derived unique email, a correlated numeric column, and formula fields.
+seed: 42
+
+tables:
+  - name: customers
+    rows: 500
+    fields:
+      - name: customer_id
+        type: id
+        strategy: sequential
+        start: 1
+      - name: full_name
+        type: name
+      - name: email
+        type: email
+        depends_on: full_name       # firstname.lastname@example.com
+        unique: true
+      - name: country
+        type: category
+        categories:
+          Panama: 0.30
+          Mexico: 0.20
+          Colombia: 0.15
+          United States: 0.20
+          Spain: 0.15
+      - name: segment
+        type: category
+        categories:
+          consumer: 0.7
+          business: 0.3
+      - name: signup_date
+        type: date
+        start: 2021-01-01
+        end: 2024-12-31
+      - name: loyalty_years
+        type: int
+        min: 0
+        max: 6
+      - name: lifetime_value
+        type: float
+        min: 0
+        max: 5000
+        round: 2
+        correlate:                  # longer loyalty -> higher LTV
+          field: loyalty_years
+          strength: 0.75
+
+  - name: products
+    rows: 80
+    fields:
+      - name: product_id
+        type: id
+        prefix: "SKU-"
+        start: 1000
+      - name: name
+        type: text
+        sentences: 1
+      - name: category
+        type: category
+        categories:
+          electronics: 0.25
+          home: 0.20
+          apparel: 0.20
+          beauty: 0.15
+          sports: 0.20
+      - name: price
+        type: float
+        min: 5
+        max: 400
+        round: 2
+      - name: cost
+        type: formula
+        expr: "round(price * 0.6, 2)"   # margin baked in
+      - name: rating
+        type: float
+        min: 1
+        max: 5
+        round: 1
+
+  - name: orders
+    rows: 2000
+    fields:
+      - name: order_id
+        type: id
+        prefix: "ORD-"
+        start: 100000
+      - name: customer_id
+        type: foreign_key
+        references: customers.customer_id
+      - name: order_date
+        type: date
+        start: 2023-01-01
+        end: 2024-12-31
+      - name: status
+        type: category
+        categories:
+          delivered: 0.65
+          shipped: 0.15
+          processing: 0.10
+          cancelled: 0.05
+          returned: 0.05
+      - name: shipping_cost
+        type: float
+        min: 0
+        max: 25
+        round: 2
+
+  - name: order_items
+    rows: 5000
+    fields:
+      - name: item_id
+        type: id
+        start: 1
+      - name: order_id
+        type: foreign_key
+        references: orders.order_id
+      - name: product_id
+        type: foreign_key
+        references: products.product_id
+      - name: quantity
+        type: int
+        min: 1
+        max: 5
+      - name: unit_price
+        type: float
+        min: 5
+        max: 400
+        round: 2
+      - name: line_total
+        type: formula
+        expr: "round(quantity * unit_price, 2)"
