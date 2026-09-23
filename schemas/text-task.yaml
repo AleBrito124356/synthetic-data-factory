@@ -1,12 +1,26 @@
-# Text-generation task (needs NVIDIA_API_KEY).
+# Text-generation task (needs NVIDIA_API_KEY, unless you --replay a cassette).
 #
-#   python cli.py generate text --task schemas/text-task.yaml \
-#       --out results/reviews.jsonl --chat results/reviews.chat.jsonl
+#   sdf generate text --task schemas/text-task.yaml \
+#       --out results/reviews.jsonl --chat results/reviews.chat.jsonl \
+#       --record results/reviews.cassette.jsonl --validate
+#
+#   # later, anywhere, with no key and no network - byte-identical output:
+#   sdf generate text --task schemas/text-task.yaml \
+#       --out results/reviews.jsonl --replay results/reviews.cassette.jsonl
+#
+#   # see what would be sent, without a key:
+#   sdf generate text --task schemas/text-task.yaml --out x.jsonl --dry-run
 #
 # task: one of  reviews | classification | personas | tickets | paraphrase
 task: reviews
 seed: 7
 temperature: 0.95
+
+# --- quota enforcement and dedup (all optional) ----------------------------
+max_rounds: 5            # 1 initial round + up to 4 top-up rounds per group
+dedup: embedding         # embedding | lexical | none (exact dupes always dropped)
+dedup_threshold: 0.92    # cosine similarity above which two texts are "the same"
+# max_duplicate_rate: 0  # --validate fails above this exact-duplicate rate
 
 # --- reviews-specific ------------------------------------------------------
 product: wireless noise-cancelling headphones

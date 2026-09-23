@@ -44,3 +44,19 @@ def test_disallowed_function_is_rejected():
 def test_subscript_is_rejected():
     with pytest.raises(FormulaError):
         Formula("a[0]")
+
+
+def test_date_helpers():
+    row = {"a": "2024-01-31", "b": "2024-03-01 18:30:00"}
+    assert Formula("year(a)").eval(row) == 2024
+    assert Formula("month(b)").eval(row) == 3
+    assert Formula("day(a)").eval(row) == 31
+    assert Formula("weekday(a)").eval(row) == 2  # a Wednesday
+    assert Formula("days_between(a, b)").eval(row) == 30
+    assert Formula("hours_between(a, b)").eval(row) == 30 * 24 + 18.5
+    assert Formula("year(x)").eval({"x": None}) is None
+
+
+def test_date_helper_rejects_non_dates():
+    with pytest.raises(FormulaError):
+        Formula("year(x)").eval({"x": "not a date"})

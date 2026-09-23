@@ -1,7 +1,8 @@
-# Q&A / instruction-pair task from seed documents (needs NVIDIA_API_KEY).
+# Q&A / instruction-pair task from seed documents (needs NVIDIA_API_KEY,
+# unless you --replay a cassette recorded earlier with --record).
 #
-#   python cli.py generate qa --task schemas/qa-example.yaml \
-#       --out results/qa.jsonl --chat results/qa.chat.jsonl --with-context
+#   sdf generate qa --task schemas/qa-example.yaml \
+#       --out results/qa.jsonl --chat results/qa.chat.jsonl --with-context --validate
 #
 task: qa
 seed: 11
