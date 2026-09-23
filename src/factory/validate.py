@@ -2,9 +2,16 @@
 
 Checks performed
 ----------------
-* **types**        — values conform to the declared type/range.
-* **uniqueness**   — fields marked unique contain no duplicates.
-* **foreign keys** — every FK value exists in the parent column.
+* **types**        — values conform to the declared type and range: numbers
+                     inside [min, max], dates inside [start, end], emails
+                     syntactically valid *and* on a reserved RFC 2606 domain,
+                     phones in the NANP fictional 555-01xx block, IPs in the
+                     RFC 5737 documentation ranges.
+* **uniqueness**   — fields marked unique (and ids) contain no duplicates.
+* **not null**     — ids and foreign keys are never null (except declared
+                     ``null_rate`` and the roots of a self-referencing FK).
+* **foreign keys** — every FK value exists in the parent column, and a
+                     self-referencing FK forms a hierarchy with no cycles.
 * **distributions**— categorical proportions are close to requested weights.
 
 The distribution report also carries an explicit note that all values are
@@ -14,10 +21,15 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .schema import FieldSpec, Schema, TableSpec
+from .providers import IPV4_DOC_NETWORKS, is_reserved_email
+from .schema import DEFAULT_DATE_END, DEFAULT_DATE_START, FieldSpec, Schema, TableSpec, parse_date
+
+_FICTIONAL_PHONE = re.compile(r"^\+1-\d{3}-555-01\d{2}$")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 SYNTHETIC_NOTE = (
     "All values in this dataset are SYNTHETIC and generated for testing, demos, "
@@ -89,10 +101,15 @@ def validate_dataset(dataset: "Any", tolerance: float = 0.05) -> ValidationRepor
             _check_type(report, table, fs, values)
             if fs.unique or fs.type == "id":
                 _check_unique(report, table, fs, values)
+            if fs.type in ("id", "foreign_key"):
+                _check_not_null(report, table, fs, values)
             if fs.type == "category":
                 _check_distribution(report, table, fs, values, tolerance)
             if fs.type == "foreign_key":
                 _check_foreign_key(report, schema, dataset, table, fs, values)
+                ref = fs.references
+                if ref and ref[0] == table.name:
+                    _check_hierarchy(report, table, fs, rows)
     return report
 
 
@@ -120,6 +137,55 @@ def _check_type(report: ValidationReport, table: TableSpec, fs: FieldSpec, value
     report.add(Check(name="type", table=table.name, field=fs.name, passed=passed, detail=detail))
 
 
+def _check_not_null(report: ValidationReport, table: TableSpec, fs: FieldSpec, values: List[Any]) -> None:
+    nulls = sum(1 for v in values if v is None)
+    ref = fs.references
+    if fs.type == "foreign_key" and ref and ref[0] == table.name:
+        # Roots of a hierarchy are null by design; at least one must exist.
+        passed = nulls >= 1 or not values
+        detail = "" if passed else "a self-referencing key needs at least one null root"
+        report.add(Check("not_null", table.name, fs.name, passed, detail))
+        return
+    allowed = fs.type == "foreign_key" and fs.null_rate > 0
+    passed = nulls == 0 or allowed
+    detail = "" if passed else f"{nulls} null value(s) in a {fs.type} column"
+    report.add(Check("not_null", table.name, fs.name, passed, detail))
+
+
+def _check_hierarchy(
+    report: ValidationReport, table: TableSpec, fs: FieldSpec, rows: List[Dict[str, Any]]
+) -> None:
+    """A self-referencing FK must form a forest: following parent pointers
+    from any row must reach a null root without revisiting a row."""
+    _, ref_col = fs.references
+    parent_of: Dict[Any, Any] = {}
+    for r in rows:
+        parent_of[_hashable(r.get(ref_col))] = r.get(fs.name)
+    cycles = 0
+    example = None
+    state: Dict[Any, int] = {}  # 1 = on the current path, 2 = proven acyclic
+    for start in parent_of:
+        path = []
+        node: Any = start
+        while node is not None and _hashable(node) in parent_of:
+            key = _hashable(node)
+            if state.get(key) == 2:
+                break
+            if state.get(key) == 1:
+                cycles += 1
+                if example is None:
+                    example = node
+                break
+            state[key] = 1
+            path.append(key)
+            node = parent_of[key]
+        for key in path:
+            state[key] = 2
+    passed = cycles == 0
+    detail = "" if passed else f"{cycles} cycle(s) in the hierarchy, e.g. through {example!r}"
+    report.add(Check("hierarchy_acyclic", table.name, fs.name, passed, detail))
+
+
 def _check_unique(report: ValidationReport, table: TableSpec, fs: FieldSpec, values: List[Any]) -> None:
     non_null = [v for v in values if v is not None]
     seen: set = set()
@@ -142,6 +208,17 @@ def _check_distribution(
     total = len(non_null)
     if total == 0:
         report.add(Check("distribution", table.name, fs.name, True, "no non-null values"))
+        return
+    if fs.unique:
+        # Each category appears at most once, so weights cannot apply; only
+        # check that every value is a declared category.
+        allowed = {str(k) for k in cats}
+        unexpected = [v for v in non_null if str(v) not in allowed]
+        passed = not unexpected
+        detail = "unique: each category at most once" + (
+            f"; {len(unexpected)} unexpected value(s), e.g. {unexpected[0]!r}" if unexpected else ""
+        )
+        report.add(Check("distribution", table.name, fs.name, passed, detail))
         return
     total_weight = sum(cats.values())
     observed = {str(k): 0 for k in cats}
@@ -286,13 +363,32 @@ def _type_ok(fs: FieldSpec, v: Any) -> bool:
         return _range_ok(fs, v)
     if t == "bool":
         return isinstance(v, bool)
-    if t in ("email",):
-        return isinstance(v, str) and "@" in v and "." in v.split("@")[-1]
+    if t == "email":
+        return is_reserved_email(v)
+    if t == "phone":
+        return isinstance(v, str) and bool(_FICTIONAL_PHONE.match(v))
+    if t == "ipv4":
+        if not isinstance(v, str) or v.count(".") != 3:
+            return False
+        net, _, host = v.rpartition(".")
+        return net in IPV4_DOC_NETWORKS and host.isdigit() and 1 <= int(host) <= 254
     if t in ("date", "datetime"):
-        return _is_isoformat(v, t)
-    if t in ("id", "uuid", "foreign_key", "formula"):
+        return _is_isoformat(v, t) and _date_in_bounds(fs, v)
+    if t == "id":
+        if fs.is_sequential_int_id:
+            return isinstance(v, int) and not isinstance(v, bool)
+        return isinstance(v, str)
+    if t == "uuid":
+        return isinstance(v, str) and bool(_UUID_RE.match(v))
+    if t in ("foreign_key", "formula"):
         return True  # value shape depends on referenced/computed types
     return isinstance(v, (str, int, float, bool))
+
+
+def _date_in_bounds(fs: FieldSpec, v: str) -> bool:
+    start = parse_date(fs.get("start", DEFAULT_DATE_START))
+    end = parse_date(fs.get("end", DEFAULT_DATE_END))
+    return start <= parse_date(v[:10]) <= end
 
 
 def _range_ok(fs: FieldSpec, v: Any) -> bool:

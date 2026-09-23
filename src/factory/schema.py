@@ -3,16 +3,22 @@
 A schema is a plain dict (usually loaded from YAML) describing one or more
 related tables. This module turns that dict into validated dataclasses and
 raises clear, actionable errors when the schema is malformed — so a typo in a
-weight or a dangling foreign key fails loudly at parse time, not with a
-confusing traceback deep inside generation.
+weight, a dangling foreign key, an impossible ``unique`` request, or an
+inverted date range fails loudly at parse time, not with a confusing
+traceback (or silently wrong data) deep inside generation.
 """
 from __future__ import annotations
 
+import datetime as _dt
+import math
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
+
+from .formula import Formula, FormulaError
+from .providers import domain_size
 
 # Field types the generator understands. Aliases map to a canonical name.
 _TYPE_ALIASES = {
@@ -51,6 +57,11 @@ _TYPE_ALIASES = {
 
 CANONICAL_TYPES = sorted(set(_TYPE_ALIASES.values()))
 
+NUMERIC_DISTRIBUTIONS = ("uniform", "normal", "exponential", "exp")
+
+DEFAULT_DATE_START = "2020-01-01"
+DEFAULT_DATE_END = "2025-12-31"
+
 
 class SchemaError(ValueError):
     """Raised when a schema is structurally invalid."""
@@ -82,6 +93,24 @@ class FieldSpec:
     def depends_on(self) -> Optional[str]:
         """Explicit intra-row dependency (e.g. email derived from a name field)."""
         return self.params.get("depends_on")
+
+    @property
+    def references(self) -> Optional[Tuple[str, str]]:
+        """``(table, column)`` for a foreign key, else None."""
+        ref = self.params.get("references")
+        if self.type != "foreign_key" or not isinstance(ref, str) or "." not in ref:
+            return None
+        table, col = ref.split(".", 1)
+        return table, col
+
+    @property
+    def is_sequential_int_id(self) -> bool:
+        """True for an ``id`` that yields plain integers (no prefix, no uuid)."""
+        return (
+            self.type == "id"
+            and self.params.get("strategy", "sequential") == "sequential"
+            and not self.params.get("prefix")
+        )
 
 
 @dataclass
@@ -123,7 +152,7 @@ class Schema:
             raise SchemaError("Schema must contain a non-empty 'tables' list.")
 
         seed = data.get("seed", 1234)
-        if not isinstance(seed, int):
+        if not isinstance(seed, int) or isinstance(seed, bool):
             raise SchemaError(f"'seed' must be an integer, got {type(seed).__name__}.")
 
         tables: List[TableSpec] = []
@@ -145,24 +174,81 @@ class Schema:
         if not os.path.exists(path):
             raise SchemaError(f"Schema file not found: {path}")
         with open(path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
+            try:
+                data = yaml.safe_load(fh)
+            except yaml.YAMLError as exc:
+                raise SchemaError(f"Schema file {path} is not valid YAML: {exc}") from exc
         return cls.from_dict(data)
 
     # ---- validation ------------------------------------------------------
     def validate(self) -> None:
-        """Cross-table checks: foreign keys resolve, weights are sane."""
+        """Cross-field and cross-table checks. Raises :class:`SchemaError`."""
         for table in self.tables:
             for fs in table.fields:
+                _validate_common(table, fs)
                 if fs.type == "category":
                     _validate_categories(table.name, fs)
                 elif fs.type == "foreign_key":
-                    _validate_foreign_key(self, table.name, fs)
+                    _validate_foreign_key(self, table, fs)
                 elif fs.type in ("int", "float"):
-                    _validate_numeric_range(table.name, fs)
+                    _validate_numeric(table, fs)
+                elif fs.type in ("date", "datetime"):
+                    _validate_temporal(table.name, fs)
+                elif fs.type == "formula":
+                    _validate_formula(table, fs)
+                elif fs.type == "id":
+                    _validate_id(table.name, fs)
+                _validate_unique_capacity(table, fs)
 
         # Foreign keys must not form a cycle across tables (a table cannot be
         # generated before the parent it references).
         _check_table_cycle(self)
+
+
+# --------------------------------------------------------------------------
+# public helpers
+# --------------------------------------------------------------------------
+def parse_date(value: Any, where: str = "") -> _dt.date:
+    """Parse an ISO date (YAML may already have produced a ``date``)."""
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    try:
+        return _dt.date.fromisoformat(str(value).strip()[:10])
+    except ValueError as exc:
+        raise SchemaError(
+            f"{where}: {value!r} is not an ISO date (expected YYYY-MM-DD)."
+        ) from exc
+
+
+def field_capacity(table: TableSpec, fs: FieldSpec) -> Optional[int]:
+    """How many distinct non-null values ``fs`` can take, or None if the
+    space is effectively unbounded. Used for the ``unique`` pigeonhole check."""
+    t = fs.type
+    if t in ("int", "float"):
+        is_int = t == "int"
+        lo = fs.get("min", 0)
+        hi = fs.get("max", 100 if is_int else 1.0)
+        if is_int:
+            return max(0, int(round(hi)) - int(round(lo)) + 1)
+        nd = fs.get("round")
+        if nd is None:
+            return None
+        scale = 10 ** int(nd)
+        return max(0, math.floor(hi * scale + 1e-9) - math.ceil(lo * scale - 1e-9) + 1)
+    if t == "category":
+        cats = fs.get("categories") or {}
+        return len(cats)
+    if t == "date":
+        start = parse_date(fs.get("start", DEFAULT_DATE_START))
+        end = parse_date(fs.get("end", DEFAULT_DATE_END))
+        return max(0, (end - start).days + 1)
+    if t == "datetime":
+        start = parse_date(fs.get("start", DEFAULT_DATE_START))
+        end = parse_date(fs.get("end", DEFAULT_DATE_END))
+        return max(0, ((end - start).days + 1) * 86400)
+    return domain_size(t)
 
 
 # --------------------------------------------------------------------------
@@ -178,7 +264,7 @@ def _parse_table(rt: Any, index: int) -> TableSpec:
     rows = rt.get("rows", rt.get("count"))
     if rows is None:
         raise SchemaError(f"Table '{name}' must specify 'rows'.")
-    if not isinstance(rows, int) or rows < 0:
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0:
         raise SchemaError(f"Table '{name}': 'rows' must be a non-negative integer.")
 
     raw_fields = rt.get("fields")
@@ -218,6 +304,30 @@ def _parse_field(table_name: str, rf: Any, index: int) -> FieldSpec:
     return FieldSpec(name=fname, type=ftype, params=params)
 
 
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _validate_common(table: TableSpec, fs: FieldSpec) -> None:
+    where = f"'{table.name}.{fs.name}'"
+    nr = fs.params.get("null_rate")
+    if nr is not None and (not _is_number(nr) or not (0.0 <= nr <= 1.0)):
+        raise SchemaError(f"{where}: null_rate must be a number between 0 and 1.")
+    dep = fs.depends_on
+    if dep is not None:
+        if dep == fs.name:
+            raise SchemaError(f"{where}: depends_on cannot point at the field itself.")
+        if table.get_field(dep) is None:
+            raise SchemaError(
+                f"{where}: depends_on refers to unknown field '{dep}' "
+                f"(fields: {', '.join(table.field_names())})."
+            )
+    if fs.type == "bool":
+        tr = fs.params.get("true_rate", 0.5)
+        if not _is_number(tr) or not (0.0 <= tr <= 1.0):
+            raise SchemaError(f"{where}: true_rate must be a number between 0 and 1.")
+
+
 def _validate_categories(table: str, fs: FieldSpec) -> None:
     cats = fs.params.get("categories")
     if cats is None:
@@ -235,7 +345,7 @@ def _validate_categories(table: str, fs: FieldSpec) -> None:
             f"a mapping of value -> weight."
         )
     for value, weight in cats.items():
-        if not isinstance(weight, (int, float)) or weight < 0:
+        if not _is_number(weight) or weight < 0:
             raise SchemaError(
                 f"'{table}.{fs.name}': weight for '{value}' must be a non-negative number."
             )
@@ -243,40 +353,124 @@ def _validate_categories(table: str, fs: FieldSpec) -> None:
         raise SchemaError(f"'{table}.{fs.name}': category weights sum to zero.")
 
 
-def _validate_numeric_range(table: str, fs: FieldSpec) -> None:
+def _validate_numeric(table: TableSpec, fs: FieldSpec) -> None:
+    where = f"'{table.name}.{fs.name}'"
     lo = fs.params.get("min")
     hi = fs.params.get("max")
+    for key, val in (("min", lo), ("max", hi)):
+        if val is not None and not _is_number(val):
+            raise SchemaError(f"{where}: '{key}' must be a number, got {val!r}.")
     if lo is not None and hi is not None and lo > hi:
-        raise SchemaError(f"'{table}.{fs.name}': min ({lo}) is greater than max ({hi}).")
+        raise SchemaError(f"{where}: min ({lo}) is greater than max ({hi}).")
+    dist = fs.params.get("distribution", "uniform")
+    if dist not in NUMERIC_DISTRIBUTIONS:
+        raise SchemaError(
+            f"{where}: unknown distribution {dist!r}. "
+            f"Valid: {', '.join(NUMERIC_DISTRIBUTIONS)}."
+        )
     corr = fs.params.get("correlate")
     if corr is not None:
         if not isinstance(corr, dict) or "field" not in corr:
-            raise SchemaError(
-                f"'{table}.{fs.name}': 'correlate' must be a mapping with a 'field' key."
-            )
+            raise SchemaError(f"{where}: 'correlate' must be a mapping with a 'field' key.")
         strength = corr.get("strength", 0.6)
-        if not isinstance(strength, (int, float)) or not (0.0 <= strength <= 1.0):
+        if not _is_number(strength) or not (0.0 <= strength <= 1.0):
+            raise SchemaError(f"{where}: correlate.strength must be between 0 and 1.")
+        driver = corr["field"]
+        if driver == fs.name:
+            raise SchemaError(f"{where}: a field cannot correlate with itself.")
+        if table.get_field(driver) is None:
             raise SchemaError(
-                f"'{table}.{fs.name}': correlate.strength must be between 0 and 1."
+                f"{where}: correlate.field refers to unknown field '{driver}' "
+                f"(fields: {', '.join(table.field_names())})."
+            )
+        direction = str(corr.get("direction", "positive")).lower()
+        if direction not in ("positive", "negative"):
+            raise SchemaError(f"{where}: correlate.direction must be 'positive' or 'negative'.")
+
+
+def _validate_temporal(table: str, fs: FieldSpec) -> None:
+    where = f"'{table}.{fs.name}'"
+    start = parse_date(fs.params.get("start", DEFAULT_DATE_START), f"{where} start")
+    end = parse_date(fs.params.get("end", DEFAULT_DATE_END), f"{where} end")
+    if end < start:
+        raise SchemaError(f"{where}: end ({end}) is before start ({start}).")
+
+
+def _validate_formula(table: TableSpec, fs: FieldSpec) -> None:
+    where = f"'{table.name}.{fs.name}'"
+    expr = fs.params.get("expr") or fs.params.get("formula")
+    if not expr:
+        raise SchemaError(f"Formula field {where} needs an 'expr'.")
+    try:
+        formula = Formula(str(expr))
+    except FormulaError as exc:
+        raise SchemaError(f"{where}: {exc}") from exc
+    for ref in formula.referenced_fields:
+        if ref == fs.name:
+            raise SchemaError(f"{where}: a formula cannot reference its own field.")
+        if table.get_field(ref) is None:
+            raise SchemaError(
+                f"{where}: formula references unknown field '{ref}' "
+                f"(fields: {', '.join(table.field_names())})."
             )
 
 
-def _validate_foreign_key(schema: Schema, table: str, fs: FieldSpec) -> None:
-    ref = fs.params.get("references")
-    if not ref or not isinstance(ref, str) or "." not in ref:
+def _validate_id(table: str, fs: FieldSpec) -> None:
+    strategy = fs.params.get("strategy", "sequential")
+    if strategy not in ("sequential", "uuid"):
         raise SchemaError(
-            f"Foreign key '{table}.{fs.name}' needs 'references' as 'table.column'."
+            f"'{table}.{fs.name}': id strategy must be 'sequential' or 'uuid', got {strategy!r}."
         )
+    start = fs.params.get("start", 1)
+    if not isinstance(start, int) or isinstance(start, bool):
+        raise SchemaError(f"'{table}.{fs.name}': id 'start' must be an integer.")
+
+
+def _validate_foreign_key(schema: Schema, table: TableSpec, fs: FieldSpec) -> None:
+    ref = fs.params.get("references")
+    where = f"Foreign key '{table.name}.{fs.name}'"
+    if not ref or not isinstance(ref, str) or "." not in ref:
+        raise SchemaError(f"{where} needs 'references' as 'table.column'.")
     ref_table_name, ref_col = ref.split(".", 1)
     ref_table = schema.get_table(ref_table_name)
     if ref_table is None:
-        raise SchemaError(
-            f"Foreign key '{table}.{fs.name}' references unknown table '{ref_table_name}'."
-        )
+        raise SchemaError(f"{where} references unknown table '{ref_table_name}'.")
     if ref_table.get_field(ref_col) is None:
         raise SchemaError(
-            f"Foreign key '{table}.{fs.name}' references unknown column "
-            f"'{ref_table_name}.{ref_col}'."
+            f"{where} references unknown column '{ref_table_name}.{ref_col}'."
+        )
+    self_ref = ref_table_name == table.name
+    if self_ref:
+        if ref_col == fs.name:
+            raise SchemaError(f"{where} cannot reference itself.")
+        if fs.unique:
+            raise SchemaError(
+                f"{where}: a self-referencing foreign key builds a hierarchy "
+                f"(many children per parent) and cannot be unique."
+            )
+        return
+    if table.rows > 0 and ref_table.rows == 0:
+        raise SchemaError(
+            f"{where} references '{ref}' but table '{ref_table_name}' has rows: 0. "
+            f"Give the parent table rows > 0."
+        )
+    if fs.unique and table.rows > ref_table.rows:
+        raise SchemaError(
+            f"Unique {where[0].lower() + where[1:]} needs at least {table.rows} parent rows "
+            f"in '{ref_table_name}', which only has {ref_table.rows}."
+        )
+
+
+def _validate_unique_capacity(table: TableSpec, fs: FieldSpec) -> None:
+    """Pigeonhole check: ``unique: true`` must be satisfiable."""
+    if not fs.unique or fs.type in ("id", "uuid", "foreign_key", "formula"):
+        return
+    capacity = field_capacity(table, fs)
+    if capacity is not None and table.rows > capacity:
+        kind = "categories" if fs.type == "category" else "distinct values"
+        raise SchemaError(
+            f"'{table.name}.{fs.name}' is unique but can only take {capacity} {kind}, "
+            f"and the table has {table.rows} rows. Widen the range or drop 'unique'."
         )
 
 
@@ -287,7 +481,7 @@ def _check_table_cycle(schema: Schema) -> None:
         for fs in table.fields:
             if fs.type == "foreign_key":
                 ref_table = fs.params["references"].split(".", 1)[0]
-                if ref_table != table.name:  # self-reference is allowed
+                if ref_table != table.name:  # self-reference builds a hierarchy
                     deps[table.name].add(ref_table)
 
     WHITE, GRAY, BLACK = 0, 1, 2
@@ -295,7 +489,7 @@ def _check_table_cycle(schema: Schema) -> None:
 
     def visit(node: str, stack: List[str]) -> None:
         color[node] = GRAY
-        for nxt in deps[node]:
+        for nxt in sorted(deps[node]):
             if color[nxt] == GRAY:
                 cycle = " -> ".join(stack + [nxt])
                 raise SchemaError(f"Foreign-key cycle between tables: {cycle}")
@@ -306,6 +500,34 @@ def _check_table_cycle(schema: Schema) -> None:
     for name in deps:
         if color[name] == WHITE:
             visit(name, [name])
+
+
+def topological_table_order(schema: Schema) -> List[str]:
+    """Table names ordered so every FK parent precedes its children."""
+    names = [t.name for t in schema.tables]
+    deps: Dict[str, set] = {name: set() for name in names}
+    for table in schema.tables:
+        for fs in table.fields:
+            ref = fs.references
+            if ref and ref[0] != table.name and ref[0] in deps:
+                deps[table.name].add(ref[0])
+
+    ordered: List[str] = []
+    visited: set = set()
+
+    def visit(node: str, stack: List[str]) -> None:
+        if node in visited:
+            return
+        for parent in sorted(deps[node]):
+            if parent in stack:
+                raise SchemaError(f"Foreign-key cycle: {' -> '.join(stack + [parent])}")
+            visit(parent, stack + [node])
+        visited.add(node)
+        ordered.append(node)
+
+    for name in names:
+        visit(name, [])
+    return ordered
 
 
 def load_schema(path_or_dict: Any) -> Schema:
