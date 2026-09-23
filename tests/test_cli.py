@@ -85,3 +85,32 @@ def test_installed_sdf_entry_point(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (tmp_path / "accounts.csv").exists()
+
+
+@pytest.mark.skipif(_installed_sdf() is None, reason="package not installed (pip install -e .)")
+def test_installed_sdf_infer_and_validate_data(tmp_path):
+    env = _clean_env()
+    real = tmp_path / "real"
+    steps = [
+        ["generate", "tabular", "--schema", os.path.join(SCHEMAS, "healthcare.yaml"),
+         "--out", str(real), "--format", "sqlite"],
+        ["infer", "--data", str(real / "dataset.db"), "--out", str(tmp_path / "inferred.yaml"),
+         "--rows-scale", "0.5"],
+        ["generate", "tabular", "--schema", str(tmp_path / "inferred.yaml"),
+         "--out", str(tmp_path / "synthetic"), "--format", "csv"],
+        ["validate", "--schema", str(tmp_path / "inferred.yaml"), "--data", str(tmp_path / "synthetic")],
+    ]
+    outputs = []
+    for step in steps:
+        proc = subprocess.run([_installed_sdf()] + step, capture_output=True, text=True, env=env, cwd=str(tmp_path))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        outputs.append(proc.stdout)
+    assert "foreign key: encounters.patient_uuid -> patients.patient_uuid" in outputs[1]
+    assert "patients: 400 -> 200 rows" in outputs[1]
+    assert "checks passed (OK)" in outputs[3]
+
+
+def test_validate_data_bad_path(tmp_path, capsys):
+    assert main(["validate", "--schema", os.path.join(SCHEMAS, "ecommerce.yaml"), "--data", str(tmp_path)]) == 1
+    assert "Data error" in capsys.readouterr().err
+    assert main(["infer", "--data", str(tmp_path), "--out", str(tmp_path / "x.yaml")]) == 1

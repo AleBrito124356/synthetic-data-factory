@@ -466,9 +466,12 @@ def _check_distribution(
             worst = dev
             worst_label = str(label)
 
-    passed = worst <= tolerance and unexpected == 0
+    # With n rows a proportion moves in steps of 1/n, so a tiny table cannot
+    # hit a weight more closely than that; never demand the impossible.
+    effective = max(tolerance, 1.0 / total)
+    passed = worst <= effective + 1e-12 and unexpected == 0
     detail = (
-        f"max deviation {worst:.3f} at '{worst_label}' (tolerance {tolerance:.3f})"
+        f"max deviation {worst:.3f} at '{worst_label}' (tolerance {effective:.3f})"
         + (f"; {unexpected} unexpected value(s)" if unexpected else "")
     )
     report.add(Check("distribution", table.name, fs.name, passed, detail))

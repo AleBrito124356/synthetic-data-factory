@@ -4,7 +4,9 @@
     sdf generate text    --task schemas/text-task.yaml   --out results/reviews.jsonl --chat results/reviews.chat.jsonl
     sdf generate qa      --task schemas/qa-example.yaml  --out results/qa.jsonl --chat results/qa.chat.jsonl
     sdf validate --schema schemas/ecommerce.yaml
+    sdf validate --schema schemas/ecommerce.yaml --data results/      # check files on disk
     sdf report   --schema schemas/saas-users.yaml
+    sdf infer    --data prod_export/ --out schemas/prod-like.yaml     # schema from real data
 
 The same commands work as ``python -m factory ...`` and, from a checkout,
 ``python cli.py ...``. Only the text and qa subcommands need an NVIDIA NIM key.
@@ -180,10 +182,44 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except SchemaError as exc:
         print(f"Schema error: {exc}", file=sys.stderr)
         return 1
-    dataset = generate(schema, seed=args.seed)
-    report = validate_dataset(dataset, tolerance=args.tolerance)
+    if args.data:
+        from .load import DataLoadError, validate_data
+
+        try:
+            report = validate_data(schema, args.data, tolerance=args.tolerance)
+        except DataLoadError as exc:
+            print(f"Data error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Validating {args.data} against {args.schema}\n")
+    else:
+        dataset = generate(schema, seed=args.seed)
+        report = validate_dataset(dataset, tolerance=args.tolerance)
     print(report.render())
     return 0 if report.ok else 1
+
+
+def cmd_infer(args: argparse.Namespace) -> int:
+    from .infer import InferenceError, fidelity_report, infer_schema, render_fidelity, yaml_header
+    from .load import DataLoadError, load_raw
+
+    try:
+        raw = load_raw(args.data)
+        result = infer_schema(raw, rows_scale=args.rows_scale, min_category_count=args.min_category_count,
+                              seed=args.seed)
+    except (DataLoadError, InferenceError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    parent = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(parent, exist_ok=True)
+    with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(result.to_yaml(yaml_header(args.data, raw.kind, args.min_category_count, args.rows_scale)))
+    print(f"Inferred {len(result.schema.tables)} table(s) from {args.data} ({raw.kind}):")
+    print(result.summary())
+    print(f"\nWrote {args.out}")
+    if not args.no_fidelity:
+        synthetic = generate(result.schema)
+        print("\n" + render_fidelity(fidelity_report(raw, result.schema, synthetic)))
+    return 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -289,11 +325,27 @@ def build_parser() -> argparse.ArgumentParser:
     _add_llm_flags(p_qa)
     p_qa.set_defaults(func=cmd_generate_qa)
 
-    p_val = sub.add_parser("validate", help="Generate from a schema and validate the result.")
+    p_val = sub.add_parser(
+        "validate", help="Validate a schema's output: freshly generated, or files on disk with --data.")
     p_val.add_argument("--schema", required=True, help="Path to a schema YAML file.")
+    p_val.add_argument("--data", default=None,
+                       help="Validate existing files instead: a folder of CSV/JSONL or a SQLite file.")
     p_val.add_argument("--seed", type=int, default=None, help="Override the schema seed.")
     p_val.add_argument("--tolerance", type=float, default=0.05, help="Max categorical deviation (default 0.05).")
     p_val.set_defaults(func=cmd_validate)
+
+    p_inf = sub.add_parser(
+        "infer", help="Infer a schema from real data (CSV/JSONL folder or SQLite) for a synthetic stand-in.")
+    p_inf.add_argument("--data", required=True, help="Folder of CSV/JSONL files, or a .db/.sqlite file.")
+    p_inf.add_argument("--out", required=True, help="Where to write the inferred schema YAML.")
+    p_inf.add_argument("--rows-scale", type=float, default=1.0,
+                       help="Multiply every table's row count (default 1.0).")
+    p_inf.add_argument("--min-category-count", type=int, default=5,
+                       help="Merge category values seen fewer times than this into 'other' (default 5).")
+    p_inf.add_argument("--seed", type=int, default=42, help="Seed written into the schema (default 42).")
+    p_inf.add_argument("--no-fidelity", action="store_true",
+                       help="Skip generating a sample and comparing it with the real data.")
+    p_inf.set_defaults(func=cmd_infer)
 
     p_rep = sub.add_parser("report", help="Generate from a schema and print a distribution report.")
     p_rep.add_argument("--schema", required=True, help="Path to a schema YAML file.")

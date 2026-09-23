@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synthetic-data-factory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Generate realistic synthetic datasets: schema-driven tabular data with referential integrity, plus LLM-generated text and Q&A on free NVIDIA NIM."
 readme = "README.md"
 requires-python = ">=3.9"
