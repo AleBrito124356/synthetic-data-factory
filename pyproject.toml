@@ -23,10 +23,7 @@ llm = ["openai>=1.30", "python-dotenv>=1.0"]
 dev = ["pytest>=7.4", "pyarrow>=14.0", "openai>=1.30", "python-dotenv>=1.0"]
 
 [project.scripts]
-sdf = "cli:main"
-
-[tool.setuptools]
-py-modules = ["cli"]
+sdf = "factory.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

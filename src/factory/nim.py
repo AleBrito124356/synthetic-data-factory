@@ -33,7 +33,7 @@ It is free and takes about two minutes:
      ...or copy .env.example to .env and paste it there.
 
 The tabular generator does NOT need a key. Try:
-  python cli.py generate tabular --schema schemas/ecommerce.yaml --out results/
+  sdf generate tabular --schema schemas/ecommerce.yaml --out results/
 """.strip()
 
 
