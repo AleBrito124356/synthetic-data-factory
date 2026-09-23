@@ -12,7 +12,12 @@ Checks performed
                      ``null_rate`` and the roots of a self-referencing FK).
 * **foreign keys** — every FK value exists in the parent column, and a
                      self-referencing FK forms a hierarchy with no cycles.
-* **distributions**— categorical proportions are close to requested weights.
+* **distributions**— categorical proportions are close to requested weights
+                     (per ``when`` case group when the field has one).
+* **relations**    — ``temporal_order`` (``after``/``before`` hold row by
+                     row), ``lookup_consistency`` (a lookup equals the
+                     parent row's column), ``when_bounds`` (each case's range
+                     or label set), ``parent_coverage`` (``min_per_parent``).
 
 The distribution report also carries an explicit note that all values are
 synthetic and must never be presented as real records.
@@ -26,7 +31,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .providers import IPV4_DOC_NETWORKS, is_reserved_email
-from .schema import DEFAULT_DATE_END, DEFAULT_DATE_START, FieldSpec, Schema, TableSpec, parse_date
+from .schema import (
+    DEFAULT_DATE_END,
+    DEFAULT_DATE_START,
+    FieldSpec,
+    Schema,
+    TableSpec,
+    effective_field,
+    parse_date,
+)
 
 _FICTIONAL_PHONE = re.compile(r"^\+1-\d{3}-555-01\d{2}$")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -93,6 +106,7 @@ def validate_dataset(dataset: "Any", tolerance: float = 0.05) -> ValidationRepor
     schema: Schema = dataset.schema
     report = ValidationReport()
 
+    ctx = _Context(schema, dataset)
     for table in schema.tables:
         rows = dataset.tables.get(table.name, [])
         _check_row_count(report, table, rows)
@@ -104,13 +118,220 @@ def validate_dataset(dataset: "Any", tolerance: float = 0.05) -> ValidationRepor
             if fs.type in ("id", "foreign_key"):
                 _check_not_null(report, table, fs, values)
             if fs.type == "category":
-                _check_distribution(report, table, fs, values, tolerance)
+                if fs.get("when") is not None:
+                    _check_when_distribution(report, table, fs, rows, tolerance)
+                else:
+                    _check_distribution(report, table, fs, values, tolerance)
             if fs.type == "foreign_key":
                 _check_foreign_key(report, schema, dataset, table, fs, values)
                 ref = fs.references
                 if ref and ref[0] == table.name:
                     _check_hierarchy(report, table, fs, rows)
+                if fs.get("min_per_parent") is not None:
+                    _check_parent_coverage(report, ctx, table, fs, values)
+            if fs.type == "lookup":
+                _check_lookup(report, ctx, table, fs, rows)
+            if fs.get("when") is not None:
+                _check_when_bounds(report, table, fs, rows)
+            if fs.anchors:
+                _check_temporal_order(report, ctx, table, fs, rows)
     return report
+
+
+class _Context:
+    """Lazily built {key -> parent row} indexes shared by relational checks."""
+
+    def __init__(self, schema: Schema, dataset: "Any"):
+        self.schema = schema
+        self.dataset = dataset
+        self._indexes: Dict[tuple, Dict[Any, Dict[str, Any]]] = {}
+
+    def parent_row(self, table_name: str, key_col: str, key: Any) -> Optional[Dict[str, Any]]:
+        idx = self._indexes.get((table_name, key_col))
+        if idx is None:
+            idx = {}
+            for r in self.dataset.tables.get(table_name, []):
+                idx.setdefault(_hashable(r.get(key_col)), r)
+            self._indexes[(table_name, key_col)] = idx
+        return idx.get(_hashable(key))
+
+    def via_value(self, table: TableSpec, row: Dict[str, Any], fk_name: str, column: str) -> Any:
+        fk = table.get_field(fk_name)
+        parent_name, key_col = fk.references
+        key = row.get(fk_name)
+        if key is None:
+            return None
+        parent = self.parent_row(parent_name, key_col, key)
+        return None if parent is None else parent.get(column)
+
+    def anchor_value(self, table: TableSpec, row: Dict[str, Any], anchor: str) -> Any:
+        if table.get_field(anchor) is not None:
+            return row.get(anchor)
+        fk_name, column = anchor.split(".", 1)
+        return self.via_value(table, row, fk_name, column)
+
+
+def _to_datetime(value: Any) -> Optional[_dt.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, _dt.datetime):
+        return value
+    if isinstance(value, _dt.date):
+        return _dt.datetime.combine(value, _dt.time.min)
+    try:
+        return _dt.datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _is_date_only(value: Any) -> bool:
+    if isinstance(value, _dt.datetime):
+        return False
+    return isinstance(value, _dt.date) or (isinstance(value, str) and len(value.strip()) == 10)
+
+
+def _check_temporal_order(report: ValidationReport, ctx: _Context, table: TableSpec, fs: FieldSpec,
+                          rows: List[Dict[str, Any]]) -> None:
+    """``after`` (with min_days/max_days) and ``before`` hold on every row.
+    Comparisons happen at day granularity when either side is a date."""
+    min_d = float(fs.get("min_days", 0) or 0)
+    max_d = fs.get("max_days")
+    for kind, anchor in fs.anchors:
+        bad = 0
+        example = None
+        checked = 0
+        for r in rows:
+            value, ref = r.get(fs.name), ctx.anchor_value(table, r, anchor)
+            v_dt, a_dt = _to_datetime(value), _to_datetime(ref)
+            if v_dt is None or a_dt is None:
+                continue
+            checked += 1
+            coarse = _is_date_only(value) or _is_date_only(ref)
+            if kind == "after":
+                lo = a_dt + _dt.timedelta(days=min_d)
+                hi = a_dt + _dt.timedelta(days=float(max_d)) if max_d is not None else None
+                if coarse:
+                    ok = v_dt.date() >= lo.date() and (hi is None or v_dt.date() <= hi.date())
+                else:
+                    ok = v_dt >= lo and (hi is None or v_dt <= hi)
+            else:
+                ok = v_dt.date() <= a_dt.date() if coarse else v_dt <= a_dt
+            if not ok:
+                bad += 1
+                if example is None:
+                    example = (value, ref)
+        gap = ""
+        if kind == "after" and (min_d or max_d is not None):
+            gap = f" (+{min_d:g}..{'' if max_d is None else f'{float(max_d):g}'} days)"
+        detail = f"{kind} {anchor}{gap}: {checked} row(s) checked"
+        if bad:
+            detail += f"; {bad} violate it, e.g. {example[0]!r} vs {example[1]!r}"
+        report.add(Check("temporal_order", table.name, fs.name, bad == 0, detail))
+
+
+def _check_lookup(report: ValidationReport, ctx: _Context, table: TableSpec, fs: FieldSpec,
+                  rows: List[Dict[str, Any]]) -> None:
+    via, column = str(fs.get("via")), str(fs.get("column"))
+    bad = 0
+    example = None
+    for r in rows:
+        if r.get(via) is None:
+            continue
+        expected = ctx.via_value(table, r, via, column)
+        if not _same_value(r.get(fs.name), expected):
+            bad += 1
+            if example is None:
+                example = (r.get(fs.name), expected)
+    detail = f"{fs.name} == {via} -> {column}"
+    if bad:
+        detail += f"; {bad} mismatch(es), e.g. {example[0]!r} != {example[1]!r}"
+    report.add(Check("lookup_consistency", table.name, fs.name, bad == 0, detail))
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+        return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(b)))
+    return str(a) == str(b)
+
+
+def _check_when_bounds(report: ValidationReport, table: TableSpec, fs: FieldSpec,
+                       rows: List[Dict[str, Any]]) -> None:
+    key_field = str(fs.get("when")["field"])
+    per_case: Dict[str, List[int]] = {}
+    example = None
+    for r in rows:
+        v = r.get(fs.name)
+        if v is None:
+            continue
+        eff = effective_field(fs, r.get(key_field))
+        case = str(r.get(key_field)) if eff is not fs else "(base)"
+        stats = per_case.setdefault(case, [0, 0])
+        stats[0] += 1
+        if fs.type in ("int", "float"):
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and _range_ok(eff, v)
+        elif fs.type == "category":
+            ok = str(v) in {str(k) for k in (eff.get("categories") or {})}
+        else:
+            ok = True
+        if not ok:
+            stats[1] += 1
+            if example is None:
+                example = (case, v)
+    bad = sum(b for _, b in per_case.values())
+    detail = ", ".join(f"{c}: {n - b}/{n} ok" for c, (n, b) in per_case.items())
+    if bad:
+        detail += f"; e.g. {example[1]!r} for {key_field}={example[0]}"
+    report.add(Check("when_bounds", table.name, fs.name, bad == 0, detail))
+
+
+def _check_when_distribution(report: ValidationReport, table: TableSpec, fs: FieldSpec,
+                             rows: List[Dict[str, Any]], tolerance: float) -> None:
+    """Weighted proportions checked inside each ``when`` case group. Groups
+    too small to measure a proportion within ``tolerance`` are skipped."""
+    key_field = str(fs.get("when")["field"])
+    groups: Dict[str, List[Any]] = {}
+    specs: Dict[str, FieldSpec] = {}
+    for r in rows:
+        eff = effective_field(fs, r.get(key_field))
+        case = str(r.get(key_field)) if eff is not fs else "(base)"
+        groups.setdefault(case, []).append(r.get(fs.name))
+        specs[case] = eff
+    worst, where = 0.0, ""
+    skipped = 0
+    min_size = int(math.ceil(1.0 / max(tolerance, 1e-6)))
+    for case, values in groups.items():
+        non_null = [v for v in values if v is not None]
+        if len(non_null) < min_size:
+            skipped += 1
+            continue
+        cats = specs[case].get("categories") or {}
+        total_w = sum(cats.values()) or 1.0
+        for label, weight in cats.items():
+            dev = abs(sum(1 for v in non_null if str(v) == str(label)) / len(non_null) - weight / total_w)
+            if dev > worst:
+                worst, where = dev, f"'{label}' when {key_field}={case}"
+    detail = f"max deviation {worst:.3f}" + (f" at {where}" if where else "") + f" (tolerance {tolerance:.3f})"
+    if skipped:
+        detail += f"; {skipped} small group(s) not measured"
+    report.add(Check("distribution", table.name, fs.name, worst <= tolerance, detail))
+
+
+def _check_parent_coverage(report: ValidationReport, ctx: _Context, table: TableSpec, fs: FieldSpec,
+                           values: List[Any]) -> None:
+    need = int(fs.get("min_per_parent") or 0)
+    parent_name, key_col = fs.references
+    counts: Dict[Any, int] = {}
+    for v in values:
+        if v is not None:
+            counts[_hashable(v)] = counts.get(_hashable(v), 0) + 1
+    parents = [_hashable(r.get(key_col)) for r in ctx.dataset.tables.get(parent_name, [])]
+    short = [p for p in parents if counts.get(p, 0) < need]
+    detail = f"every {parent_name} row has >= {need} {table.name} row(s)"
+    if short:
+        detail += f"; {len(short)} parent(s) below, e.g. {short[0]!r} has {counts.get(short[0], 0)}"
+    report.add(Check("parent_coverage", table.name, fs.name, not short, detail))
 
 
 def _check_row_count(report: ValidationReport, table: TableSpec, rows: List[Dict[str, Any]]) -> None:
@@ -128,9 +349,14 @@ def _check_row_count(report: ValidationReport, table: TableSpec, rows: List[Dict
 
 def _check_type(report: ValidationReport, table: TableSpec, fs: FieldSpec, values: List[Any]) -> None:
     non_null = [v for v in values if v is not None]
+    spec = fs
+    if fs.get("when") is not None:
+        # Ranges differ per case; when_bounds checks them. Here: type only.
+        spec = FieldSpec(fs.name, fs.type, {k: v for k, v in fs.params.items()
+                                            if k not in ("min", "max", "when")})
     bad: List[Any] = []
     for v in non_null:
-        if not _type_ok(fs, v):
+        if not _type_ok(spec, v):
             bad.append(v)
     passed = not bad
     detail = "" if passed else f"{len(bad)} value(s) fail type '{fs.type}', e.g. {bad[0]!r}"
@@ -286,7 +512,19 @@ def distribution_report(dataset: "Any") -> Dict[str, Any]:
         fields_summary: Dict[str, Any] = {}
         for fs in table.fields:
             values = [r.get(fs.name) for r in rows]
-            fields_summary[fs.name] = _summarize_field(fs, values)
+            summary = _summarize_field(fs, values)
+            when = fs.get("when")
+            if isinstance(when, dict) and fs.type in ("int", "float", "category"):
+                key = str(when["field"])
+                groups: Dict[str, List[Any]] = {}
+                for r in rows:
+                    groups.setdefault(str(r.get(key)), []).append(r.get(fs.name))
+                summary["when_field"] = key
+                summary["cases"] = {
+                    case: _summarize_field(effective_field(fs, case), vals)
+                    for case, vals in groups.items()
+                }
+            fields_summary[fs.name] = summary
         out["tables"][table.name] = {"rows": len(rows), "fields": fields_summary}
     return out
 
@@ -297,22 +535,29 @@ def render_distribution_report(report: Dict[str, Any]) -> str:
         lines.append(f"## {table_name}  ({tinfo['rows']} rows)")
         for fname, summary in tinfo["fields"].items():
             lines.append(f"- {fname} [{summary['type']}] nulls={summary['nulls']}")
-            if summary["type"] in ("int", "float") and summary.get("count"):
-                lines.append(
-                    f"    min={summary['min']:.3g} max={summary['max']:.3g} "
-                    f"mean={summary['mean']:.3g} std={summary['std']:.3g}"
-                )
-            elif summary["type"] == "category":
-                parts = ", ".join(
-                    f"{k}={v['observed']:.2f}/{v['expected']:.2f}"
-                    for k, v in summary["categories"].items()
-                )
-                lines.append(f"    observed/expected: {parts}")
-            else:
-                lines.append(f"    distinct={summary['distinct']} sample={summary.get('sample')!r}")
+            lines.extend(_render_summary(summary, "    "))
+            for case, case_summary in (summary.get("cases") or {}).items():
+                lines.append(f"    when {summary['when_field']}={case}:")
+                lines.extend(_render_summary(case_summary, "      "))
         lines.append("")
     lines.append(report["note"])
     return "\n".join(lines)
+
+
+def _render_summary(summary: Dict[str, Any], pad: str) -> List[str]:
+    if summary["type"] in ("int", "float"):
+        if not summary.get("count") or "min" not in summary:
+            return [f"{pad}no numeric values"]
+        return [
+            f"{pad}min={summary['min']:.3g} max={summary['max']:.3g} "
+            f"mean={summary['mean']:.3g} std={summary['std']:.3g}"
+        ]
+    if summary["type"] == "category":
+        parts = ", ".join(
+            f"{k}={v['observed']:.2f}/{v['expected']:.2f}" for k, v in summary["categories"].items()
+        )
+        return [f"{pad}observed/expected: {parts}"]
+    return [f"{pad}distinct={summary['distinct']} sample={summary.get('sample')!r}"]
 
 
 def _summarize_field(fs: FieldSpec, values: List[Any]) -> Dict[str, Any]:
@@ -380,15 +625,22 @@ def _type_ok(fs: FieldSpec, v: Any) -> bool:
         return isinstance(v, str)
     if t == "uuid":
         return isinstance(v, str) and bool(_UUID_RE.match(v))
-    if t in ("foreign_key", "formula"):
+    if t in ("foreign_key", "formula", "lookup"):
         return True  # value shape depends on referenced/computed types
     return isinstance(v, (str, int, float, bool))
 
 
 def _date_in_bounds(fs: FieldSpec, v: str) -> bool:
-    start = parse_date(fs.get("start", DEFAULT_DATE_START))
-    end = parse_date(fs.get("end", DEFAULT_DATE_END))
-    return start <= parse_date(v[:10]) <= end
+    if fs.anchors:
+        # Anchored fields only honour explicit bounds; the default window
+        # does not apply (temporal_order checks the anchors).
+        start = parse_date(fs.get("start")) if "start" in fs.params else None
+        end = parse_date(fs.get("end")) if "end" in fs.params else None
+    else:
+        start = parse_date(fs.get("start", DEFAULT_DATE_START))
+        end = parse_date(fs.get("end", DEFAULT_DATE_END))
+    d = parse_date(v[:10])
+    return (start is None or start <= d) and (end is None or d <= end)
 
 
 def _range_ok(fs: FieldSpec, v: Any) -> bool:

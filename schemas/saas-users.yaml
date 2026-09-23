@@ -1,6 +1,9 @@
 # SaaS product analytics: accounts -> users -> events.
 # Exercises datetime fields, an exponential-distributed duration, a boolean
-# with a controlled true-rate, and MRR correlated with seat count.
+# with a controlled true-rate, and MRR correlated with seat count - with the
+# plan driving both through `when`, so a free account never pays and an
+# enterprise account never has 2 seats. Users log in after their account was
+# created, and every event happens before the user's last login.
 seed: 2024
 
 tables:
@@ -25,14 +28,26 @@ tables:
         max: 250
         distribution: exponential
         scale: 20
+        when:
+          field: plan
+          cases:
+            free:       { min: 1, max: 3, distribution: uniform }
+            pro:        { min: 3, max: 50, scale: 10 }
+            enterprise: { min: 50, max: 250, scale: 60 }
       - name: mrr
         type: float
         min: 0
         max: 12000
         round: 2
-        correlate:
+        correlate:                 # within each plan, more seats -> more MRR
           field: seats
           strength: 0.85
+        when:
+          field: plan
+          cases:
+            free:       { min: 0, max: 0 }
+            pro:        { min: 49, max: 2500 }
+            enterprise: { min: 2500, max: 12000 }
       - name: region
         type: category
         categories:
@@ -55,6 +70,8 @@ tables:
       - name: account_id
         type: foreign_key
         references: accounts.account_id
+        min_per_parent: 1          # every account has at least one user
+        skew: zipf                 # and a few accounts have many
       - name: full_name
         type: name
       - name: email
@@ -74,6 +91,7 @@ tables:
         type: datetime
         start: 2024-06-01
         end: 2024-12-31
+        after: account_id.created_at   # cannot log in before the account exists
 
   - name: events
     rows: 8000
@@ -101,4 +119,4 @@ tables:
       - name: ts
         type: datetime
         start: 2024-06-01
-        end: 2024-12-31
+        before: user_id.last_login     # activity happens up to the last login

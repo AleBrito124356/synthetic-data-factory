@@ -1,6 +1,12 @@
 # E-commerce dataset: customers -> orders -> order_items, plus a products
 # catalog. Exercises foreign keys across three levels, weighted categoricals,
-# a name-derived unique email, a correlated numeric column, and formula fields.
+# a name-derived unique email, a correlated numeric column, formula fields,
+# and the relational options that keep the tables coherent with each other:
+#
+#   after:          an order is never placed before the customer signed up
+#   lookup:         a line item's unit_price is the product's catalog price
+#   min_per_parent: every order has at least one line item
+#   skew: zipf      a few products sell far more than the rest
 seed: 42
 
 tables:
@@ -34,10 +40,9 @@ tables:
         type: date
         start: 2021-01-01
         end: 2024-12-31
-      - name: loyalty_years
-        type: int
-        min: 0
-        max: 6
+      - name: loyalty_years           # full years as a customer by end of 2024
+        type: formula
+        expr: "2024 - year(signup_date)"
       - name: lifetime_value
         type: float
         min: 0
@@ -93,6 +98,7 @@ tables:
         type: date
         start: 2023-01-01
         end: 2024-12-31
+        after: customer_id.signup_date   # never before the customer existed
       - name: status
         type: category
         categories:
@@ -116,18 +122,20 @@ tables:
       - name: order_id
         type: foreign_key
         references: orders.order_id
+        min_per_parent: 1              # no empty orders
       - name: product_id
         type: foreign_key
         references: products.product_id
+        skew: zipf                     # realistic best-sellers / long tail
+        zipf_s: 0.8                    # gentler than the default 1.1
       - name: quantity
         type: int
         min: 1
         max: 5
       - name: unit_price
-        type: float
-        min: 5
-        max: 400
-        round: 2
+        type: lookup                   # = products.price of this row's product
+        via: product_id
+        column: price
       - name: line_total
         type: formula
         expr: "round(quantity * unit_price, 2)"

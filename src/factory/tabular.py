@@ -4,7 +4,11 @@ Given a :class:`~factory.schema.Schema`, produce related tables with:
 
 * realistic per-type values (names, emails, dates, categoricals, ...),
 * referential integrity across foreign keys (including self-references,
-  which become a proper hierarchy with null roots),
+  which become a proper hierarchy with null roots), with optional
+  ``min_per_parent`` coverage and ``skew: zipf`` popularity,
+* ``lookup`` columns copied from the referenced parent row,
+* temporal order: ``after``/``before`` a sibling or a parent's date,
+* ``when``: per-category parameter overrides (free plan -> mrr 0),
 * weighted categoricals that closely match requested proportions,
 * simple rank-based correlations between numeric columns,
 * formula/computed columns evaluated from sibling columns (null-safe),
@@ -41,8 +45,10 @@ from .schema import (
     Schema,
     SchemaError,
     TableSpec,
+    effective_field,
     load_schema,
     parse_date,
+    temporal_window,
     topological_table_order,
 )
 
@@ -83,6 +89,7 @@ class TabularGenerator:
     # ---- public API ------------------------------------------------------
     def generate(self, seed: Optional[int] = None) -> Dataset:
         seed = self.schema.seed if seed is None else seed
+        self._index_cache: Dict[tuple, Dict[Any, int]] = {}
         tables: Dict[str, Rows] = {}
         for table_name in topological_table_order(self.schema):
             table = self.schema.get_table(table_name)
@@ -124,13 +131,20 @@ class TabularGenerator:
         ref = fs.references
         nulls_handled = False
 
-        if t == "category":
+        if fs.get("when") is not None:
+            values = self._gen_when(fs, table, n, rng, providers, columns, done)
+        elif t == "category":
             values = self._gen_category(fs, n, rng)
         elif t == "foreign_key" and ref and ref[0] == table.name:
             values = self._gen_self_reference(fs, n, rng, columns)
             nulls_handled = True
         elif t == "foreign_key":
             values = self._gen_foreign_key(fs, n, rng, done)
+            nulls_handled = fs.get("min_per_parent") is not None
+        elif t == "lookup":
+            values = self._gen_lookup(fs, table, n, columns, done)
+        elif t in ("date", "datetime") and fs.anchors:
+            values = self._gen_anchored_temporal(fs, table, n, providers, columns, done)
         elif t == "formula":
             values = self._gen_formula(fs, table, n, columns)
         elif t in ("int", "float"):
@@ -245,7 +259,161 @@ class TabularGenerator:
             pool = list(parent_values)
             rng.shuffle(pool)
             return pool[:n]
-        return [rng.choice(parent_values) for _ in range(n)]
+        min_per_parent = fs.get("min_per_parent")
+        skew = fs.get("skew", "uniform")
+        if min_per_parent is None and skew == "uniform":
+            return [rng.choice(parent_values) for _ in range(n)]
+
+        # Guaranteed children first (every parent gets min_per_parent), then
+        # the rest drawn uniformly or by Zipf popularity. Nulls only ever
+        # replace the extra draws, so coverage survives null_rate.
+        guaranteed = list(parent_values) * int(min_per_parent or 0)
+        extra_n = n - len(guaranteed)
+        if skew == "zipf":
+            order = list(range(len(parent_values)))
+            rng.shuffle(order)  # which parents are popular is itself seeded
+            s_exp = float(fs.get("zipf_s", 1.1))
+            weights = [0.0] * len(parent_values)
+            for rank, idx in enumerate(order, start=1):
+                weights[idx] = 1.0 / (rank ** s_exp)
+            extra = rng.choices(parent_values, weights=weights, k=extra_n)
+        else:
+            extra = [rng.choice(parent_values) for _ in range(extra_n)]
+        if min_per_parent is not None and fs.null_rate > 0:
+            extra = [None if rng.random() < fs.null_rate else v for v in extra]
+        values = guaranteed + extra
+        rng.shuffle(values)
+        return values
+
+    def _parent_index(self, table_name: str, key_col: str, rows: Rows) -> Dict[Any, int]:
+        """{key value -> row index} for a parent table (cached per run)."""
+        cache_key = (table_name, key_col, id(rows))
+        index = self._index_cache.get(cache_key) if hasattr(self, "_index_cache") else None
+        if index is None:
+            index = {}
+            for i, r in enumerate(rows):
+                index.setdefault(r.get(key_col), i)
+            if hasattr(self, "_index_cache"):
+                self._index_cache[cache_key] = index
+        return index
+
+    def _parent_values(
+        self,
+        fk: FieldSpec,
+        column: str,
+        table: TableSpec,
+        n: int,
+        columns: Dict[str, List[Any]],
+        done: Dict[str, Rows],
+    ) -> List[Any]:
+        """For every row, ``column`` of the parent row its FK ``fk`` points at."""
+        parent_name, key_col = fk.references
+        keys = columns[fk.name]
+        if parent_name == table.name:
+            key_values = columns[key_col]
+            parent_col = columns[column]
+            index = {}
+            for i, k in enumerate(key_values):
+                index.setdefault(k, i)
+            return [parent_col[index[k]] if k in index else None for k in keys]
+        parent_rows = done[parent_name]
+        index = self._parent_index(parent_name, key_col, parent_rows)
+        return [parent_rows[index[k]].get(column) if k in index else None for k in keys]
+
+    def _gen_lookup(
+        self, fs: FieldSpec, table: TableSpec, n: int, columns: Dict[str, List[Any]], done: Dict[str, Rows]
+    ) -> List[Any]:
+        """Copy ``column`` from the parent row referenced by the ``via`` FK,
+        e.g. ``order_items.unit_price = products.price``."""
+        fk = table.get_field(str(fs.get("via")))
+        return self._parent_values(fk, str(fs.get("column")), table, n, columns, done)
+
+    def _anchor_values(
+        self, anchor: str, table: TableSpec, n: int, columns: Dict[str, List[Any]], done: Dict[str, Rows]
+    ) -> List[Any]:
+        if anchor in columns:
+            return columns[anchor]
+        fk_name, col = anchor.split(".", 1)
+        return self._parent_values(table.get_field(fk_name), col, table, n, columns, done)
+
+    def _gen_anchored_temporal(
+        self,
+        fs: FieldSpec,
+        table: TableSpec,
+        n: int,
+        providers: Providers,
+        columns: Dict[str, List[Any]],
+        done: Dict[str, Rows],
+    ) -> List[Any]:
+        """Dates/datetimes that respect ``after`` (+min_days/max_days) and
+        ``before`` anchors row by row."""
+        after = fs.get("after")
+        before = fs.get("before")
+        after_vals = self._anchor_values(str(after), table, n, columns, done) if after else [None] * n
+        before_vals = self._anchor_values(str(before), table, n, columns, done) if before else [None] * n
+        is_date = fs.type == "date"
+        out: List[Any] = []
+        for i in range(n):
+            lo, hi = temporal_window(fs, after_vals[i], before_vals[i])
+            if is_date:
+                # Dates compare at day granularity, so a date "after" a
+                # datetime anchor may share the anchor's day.
+                lo_d, hi_d = lo.date(), hi.date()
+                if lo_d > hi_d:
+                    raise SchemaError(
+                        f"'{table.name}.{fs.name}' row {i}: no date satisfies "
+                        f"after={after_vals[i]!r} / before={before_vals[i]!r} within its bounds."
+                    )
+                out.append(providers.date_between(lo_d, hi_d).isoformat())
+            else:
+                if lo > hi:
+                    raise SchemaError(
+                        f"'{table.name}.{fs.name}' row {i}: no datetime satisfies "
+                        f"after={after_vals[i]!r} / before={before_vals[i]!r} within its bounds."
+                    )
+                lo_s = lo.replace(microsecond=0) + (_dt.timedelta(seconds=1) if lo.microsecond else _dt.timedelta(0))
+                value = providers.datetime_between(lo_s, hi.replace(microsecond=0))
+                out.append(value.isoformat(sep=" ", timespec="seconds"))
+        return out
+
+    def _gen_when(
+        self,
+        fs: FieldSpec,
+        table: TableSpec,
+        n: int,
+        rng: random.Random,
+        providers: Providers,
+        columns: Dict[str, List[Any]],
+        done: Dict[str, Rows],
+    ) -> List[Any]:
+        """Generate each ``when`` case group with its own parameters, so
+        e.g. free-plan rows get ``mrr: 0`` and enterprise rows 50-250 seats.
+        Weighted categoricals keep exact per-group proportions, and
+        correlations are ranked within each group."""
+        key_values = columns[str(fs.get("when")["field"])]
+        groups: Dict[str, List[int]] = {}
+        specs: Dict[str, FieldSpec] = {}
+        for i, kv in enumerate(key_values):
+            eff = effective_field(fs, kv)
+            gid = "__base__" if eff is fs else str(kv)
+            groups.setdefault(gid, []).append(i)
+            specs[gid] = eff if eff is not fs else FieldSpec(
+                fs.name, fs.type, {k: v for k, v in fs.params.items() if k != "when"})
+        out: List[Any] = [None] * n
+        for gid in sorted(groups, key=lambda g: (g == "__base__", g)):
+            idx = groups[gid]
+            spec = specs[gid]
+            sub_columns = {name: [col[i] for i in idx] for name, col in columns.items()}
+            m = len(idx)
+            if spec.type == "category":
+                vals = self._gen_category(spec, m, rng)
+            elif spec.type in ("int", "float"):
+                vals = self._gen_numeric(spec, m, rng, sub_columns)
+            else:
+                vals = [self._gen_scalar(spec, rng, providers, sub_columns, j) for j in range(m)]
+            for j, i in enumerate(idx):
+                out[i] = vals[j]
+        return out
 
     def _gen_self_reference(
         self, fs: FieldSpec, n: int, rng: random.Random, columns: Dict[str, List[Any]]
@@ -581,8 +749,24 @@ def field_dependencies(table: TableSpec, fs: FieldSpec) -> set:
     ref = fs.references
     if ref and ref[0] == table.name and ref[1] in field_names:
         d.add(ref[1])  # self-reference: keys first, then the pointers
+    if fs.type == "lookup":
+        via = table.get_field(str(fs.get("via")))
+        if via is not None:
+            d.add(via.name)
+            vref = via.references
+            if vref and vref[0] == table.name:
+                d.add(vref[1])
+                d.add(str(fs.get("column")))
+    when = fs.get("when")
+    if isinstance(when, dict) and when.get("field") in field_names:
+        d.add(when["field"])
+    for _, anchor in fs.anchors:
+        if anchor in field_names:
+            d.add(anchor)
+        elif "." in anchor and anchor.split(".", 1)[0] in field_names:
+            d.add(anchor.split(".", 1)[0])
     d.discard(fs.name)
-    return d
+    return {x for x in d if x in field_names}
 
 
 def _field_order(table: TableSpec) -> List[str]:

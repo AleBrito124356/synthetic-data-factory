@@ -128,6 +128,9 @@ def sqlite_column_types(dataset: "Any") -> Dict[str, Dict[str, str]]:
         elif t == "foreign_key" and depth < 50:
             ref_table, ref_col = fs.references
             out = col_type(ref_table, ref_col, depth + 1)
+        elif t == "lookup" and depth < 50:
+            via = table.get_field(str(fs.get("via")))
+            out = col_type(via.references[0], str(fs.get("column")), depth + 1)
         elif t in ("formula", "category", "lookup"):
             values = [r.get(field_name) for r in dataset.tables.get(table_name, [])]
             if t == "category" and not any(v is not None for v in values):
