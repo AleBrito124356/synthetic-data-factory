@@ -420,3 +420,142 @@ def _hashable(v: Any) -> Any:
         return v
     except TypeError:
         return str(v)
+
+
+# --------------------------------------------------------------------------
+# text / qa record validation
+# --------------------------------------------------------------------------
+_TEXT_REQUIRED = {
+    "paraphrase": ("text", "intent"),
+    "classification": ("text", "label"),
+    "personas": ("text", "context"),
+    "reviews": ("text", "sentiment", "rating", "product"),
+    "tickets": ("subject", "body", "text", "category"),
+}
+_RATING_RANGES = {"positive": (4, 5), "neutral": (3, 3), "negative": (1, 2)}
+
+
+def validate_records(
+    records: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    kind: str = "text",
+    max_duplicate_rate: Optional[float] = None,
+) -> ValidationReport:
+    """Validate generated text or Q&A records against the task that asked for them.
+
+    Text tasks: required fields present and non-empty, labels inside the
+    configured set, every group exactly at its quota, duplicate rate (exact,
+    case/whitespace-insensitive, within a group) at most ``max_duplicate_rate``
+    (default 0), and for reviews a rating consistent with the sentiment.
+
+    Q&A: required fields, no ``NOT_IN_PASSAGE`` answers, every pair scored at
+    least ``min_quality`` on all three axes, a hard negative that differs from
+    the answer (when enabled), and no duplicate questions.
+    """
+    if max_duplicate_rate is None:
+        max_duplicate_rate = float(config.get("max_duplicate_rate", 0.0))
+    report = ValidationReport()
+    task = "qa" if kind == "qa" else str(config.get("task", "")).lower()
+    report.add(Check("record_count", task, "", bool(records), f"{len(records)} record(s)"))
+    if kind == "qa":
+        _validate_qa_records(report, records, config, max_duplicate_rate)
+        return report
+
+    from .text import text_task_quotas
+
+    shape = text_task_quotas(config)
+    group_key, quotas = shape["group_key"], {str(k): v for k, v in shape["quotas"].items()}
+    _check_required(report, task, records, _TEXT_REQUIRED.get(task, ("text",)))
+
+    labels = [str(r.get(group_key)) for r in records]
+    unexpected = sorted({l for l in labels if l not in quotas})
+    report.add(Check(
+        "label_set", task, group_key, not unexpected,
+        f"allowed: {', '.join(quotas)}" + (f"; unexpected: {', '.join(unexpected)}" if unexpected else ""),
+    ))
+
+    counts: Dict[str, int] = {g: 0 for g in quotas}
+    for l in labels:
+        counts[l] = counts.get(l, 0) + 1
+    off = {g: (counts.get(g, 0), q) for g, q in quotas.items() if counts.get(g, 0) != q}
+    detail = ", ".join(f"{g}={counts.get(g, 0)}/{q}" for g, q in quotas.items())
+    report.add(Check("quota", task, group_key, not off, detail))
+
+    dupes = 0
+    seen: set = set()
+    for r in records:
+        key = (str(r.get(group_key)), _norm_text(r.get("text", "")))
+        if key in seen:
+            dupes += 1
+        seen.add(key)
+    rate = dupes / len(records) if records else 0.0
+    report.add(Check(
+        "duplicates", task, "text", rate <= max_duplicate_rate,
+        f"{dupes} duplicate(s), rate {rate:.3f} (max {max_duplicate_rate:.3f})",
+    ))
+
+    if task == "reviews":
+        bad = [r for r in records
+               if str(r.get("sentiment")) in _RATING_RANGES
+               and not (_RATING_RANGES[str(r.get("sentiment"))][0]
+                        <= _as_int(r.get("rating")) <= _RATING_RANGES[str(r.get("sentiment"))][1])]
+        report.add(Check("rating_matches_sentiment", task, "rating", not bad,
+                         f"{len(bad)} inconsistent rating(s)" if bad else ""))
+    return report
+
+
+def _validate_qa_records(report: ValidationReport, records: List[Dict[str, Any]],
+                         config: Dict[str, Any], max_duplicate_rate: float) -> None:
+    required = ["question", "answer", "context", "source", "quality"]
+    hard_negatives = bool(config.get("hard_negatives", True))
+    if hard_negatives:
+        required.append("hard_negative")
+    _check_required(report, "qa", records, required)
+
+    unanswerable = [r for r in records if "NOT_IN_PASSAGE" in str(r.get("answer", "")).upper()]
+    report.add(Check("answerable", "qa", "answer", not unanswerable,
+                     f"{len(unanswerable)} NOT_IN_PASSAGE answer(s)" if unanswerable else ""))
+
+    min_quality = int(config.get("min_quality", 4))
+    low = []
+    for r in records:
+        q = r.get("quality")
+        axes = [q.get(a, 0) for a in ("groundedness", "answerability", "clarity")] if isinstance(q, dict) else [0]
+        if min(axes) < min_quality:
+            low.append(r)
+    report.add(Check("quality_min", "qa", "quality", not low,
+                     f"min quality {min_quality}" + (f"; {len(low)} pair(s) below" if low else "")))
+
+    if hard_negatives:
+        same = [r for r in records if _norm_text(r.get("hard_negative", "")) == _norm_text(r.get("answer", ""))]
+        report.add(Check("hard_negative_differs", "qa", "hard_negative", not same,
+                         f"{len(same)} hard negative(s) identical to the answer" if same else ""))
+
+    questions = [_norm_text(r.get("question", "")) for r in records]
+    dupes = len(questions) - len(set(questions))
+    rate = dupes / len(records) if records else 0.0
+    report.add(Check("duplicates", "qa", "question", rate <= max_duplicate_rate,
+                     f"{dupes} duplicate question(s), rate {rate:.3f} (max {max_duplicate_rate:.3f})"))
+
+
+def _check_required(report: ValidationReport, task: str, records: List[Dict[str, Any]],
+                    required: Any) -> None:
+    missing: Dict[str, int] = {}
+    for r in records:
+        for key in required:
+            value = r.get(key)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                missing[key] = missing.get(key, 0) + 1
+    detail = ", ".join(f"{k} missing/empty in {n}" for k, n in missing.items())
+    report.add(Check("required_fields", task, "", not missing, detail or f"fields: {', '.join(required)}"))
+
+
+def _norm_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1

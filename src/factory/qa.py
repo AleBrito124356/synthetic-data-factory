@@ -4,22 +4,24 @@ Turn reference docs into supervised pairs for RAG evaluation or fine-tuning:
 
 1. **Chunk** each document into overlapping windows.
 2. **Generate questions** grounded in each chunk.
-3. **Answer** each question using only that chunk.
+3. **Answer** each question using only that chunk (``NOT_IN_PASSAGE`` answers
+   are skipped).
 4. **Hard negatives** — a plausible-but-wrong answer for the same question,
    useful for training rerankers / answer verifiers or as contrastive data.
 5. **Self-critique filter** — the model scores each pair for groundedness,
    answerability, and clarity; weak items are dropped.
 
-The result is a list of pair dicts that :mod:`factory.export` can write as
-chat-format JSONL for SFT.
+The result is a :class:`QAResult` (a list of pair dicts plus counters) that
+:mod:`factory.export` can write as chat-format JSONL for SFT.
 """
 from __future__ import annotations
 
 import os
 import random
+import re
 from typing import Any, Dict, List, Optional, Sequence
 
-from .nim import NIMClient
+from .llm import CassetteMissError, LLMError, as_text, as_text_list
 
 _QGEN_SYSTEM = (
     "You are a meticulous dataset author. You write clear, self-contained "
@@ -33,12 +35,33 @@ _CRITIQUE_SYSTEM = (
     "You are a strict data-quality reviewer. You score question-answer pairs "
     "and never inflate scores."
 )
+QUALITY_AXES = ("groundedness", "answerability", "clarity")
+
+
+class QAResult(list):
+    """Kept pairs plus what happened to the others."""
+
+    def __init__(self, records: Sequence[Dict[str, Any]] = (), chunks: int = 0,
+                 candidates: int = 0, unanswerable: int = 0, low_quality: int = 0,
+                 duplicates: int = 0, requests: int = 0):
+        super().__init__(records)
+        self.chunks = chunks
+        self.candidates = candidates
+        self.unanswerable = unanswerable
+        self.low_quality = low_quality
+        self.duplicates = duplicates
+        self.requests = requests
 
 
 class QAFactory:
-    def __init__(self, client: Optional[NIMClient] = None, seed: int = 11):
-        self.client = client or NIMClient()
+    def __init__(self, client: Optional[Any] = None, seed: int = 11):
+        if client is None:
+            from .nim import NIMClient  # raises MissingAPIKeyError without a key
+
+            client = NIMClient()
+        self.client = client
         self.rng = random.Random(seed)
+        self._requests = 0
 
     # ---- public ----------------------------------------------------------
     def generate(
@@ -50,15 +73,28 @@ class QAFactory:
         hard_negatives: bool = True,
         min_quality: int = 4,
         temperature: float = 0.7,
-    ) -> List[Dict[str, Any]]:
+    ) -> QAResult:
         pairs: List[Dict[str, Any]] = []
+        chunks = 0
+        candidates = 0
+        unanswerable = 0
+        duplicates = 0
+        seen_questions: set = set()
+        start_requests = self._requests
         for doc in docs:
             source = doc.get("source", "seed")
             for c_index, chunk in enumerate(_chunk_text(doc["text"], chunk_size, overlap)):
-                questions = self._gen_questions(chunk, questions_per_chunk, temperature)
-                for q in questions:
+                chunks += 1
+                for q in self._gen_questions(chunk, questions_per_chunk, temperature):
+                    candidates += 1
+                    key = _normalize(q)
+                    if key in seen_questions:
+                        duplicates += 1  # overlapping chunks often repeat a question
+                        continue
+                    seen_questions.add(key)
                     answer = self._gen_answer(chunk, q, temperature)
-                    if _is_unanswerable(answer):
+                    if not answer or _is_unanswerable(answer):
+                        unanswerable += 1
                         continue
                     record: Dict[str, Any] = {
                         "question": q,
@@ -71,26 +107,24 @@ class QAFactory:
                         record["hard_negative"] = self._gen_hard_negative(chunk, q, answer, temperature)
                     pairs.append(record)
 
-        return self._filter_by_quality(pairs, min_quality)
+        kept = self._filter_by_quality(pairs, min_quality)
+        return QAResult(kept, chunks=chunks, candidates=candidates, unanswerable=unanswerable,
+                        low_quality=len(pairs) - len(kept), duplicates=duplicates,
+                        requests=self._requests - start_requests)
 
     # ---- steps -----------------------------------------------------------
     def _gen_questions(self, chunk: str, n: int, temperature: float) -> List[str]:
-        prompt = (
-            f"Read the passage and write {n} distinct questions that are fully "
-            f"answerable from it alone. Prefer specific, non-trivial questions. "
-            f"Return a JSON array of {n} strings.\n\nPassage:\n{chunk}"
-        )
-        obj = self.client.chat_json(prompt, system=_QGEN_SYSTEM, temperature=temperature)
-        items = obj if isinstance(obj, list) else [obj]
+        self._requests += 1
+        obj = self.client.chat_json(question_prompt(chunk, n), system=_QGEN_SYSTEM, temperature=temperature)
         out: List[str] = []
-        for q in items[:n]:
-            text = q if isinstance(q, str) else str(q.get("question", q)) if isinstance(q, dict) else str(q)
-            text = text.strip()
-            if text:
+        for q in as_text_list(obj, keys=("questions", "question")):
+            text = q.strip()
+            if text and text not in out:
                 out.append(text)
-        return out
+        return out[:n]
 
     def _gen_answer(self, chunk: str, question: str, temperature: float) -> str:
+        self._requests += 1
         prompt = (
             f"Passage:\n{chunk}\n\nQuestion: {question}\n\n"
             f"Answer the question using only the passage, in 1-3 sentences. "
@@ -100,6 +134,7 @@ class QAFactory:
         return self.client.chat(prompt, system=_ANSWER_SYSTEM, temperature=min(temperature, 0.4)).strip()
 
     def _gen_hard_negative(self, chunk: str, question: str, answer: str, temperature: float) -> str:
+        self._requests += 1
         prompt = (
             f"Question: {question}\nCorrect answer: {answer}\n\n"
             f"Write a HARD NEGATIVE: an answer that sounds plausible and is on-topic "
@@ -108,23 +143,19 @@ class QAFactory:
             f"as a JSON string.\n\nPassage:\n{chunk}"
         )
         obj = self.client.chat_json(prompt, temperature=temperature)
-        if isinstance(obj, str):
-            return obj.strip()
-        if isinstance(obj, dict):
-            return str(obj.get("answer", next(iter(obj.values()), ""))).strip()
-        return str(obj).strip()
+        return as_text(obj, keys=("hard_negative", "wrong_answer", "answer")).strip()
 
     def _filter_by_quality(self, pairs: List[Dict[str, Any]], min_quality: int) -> List[Dict[str, Any]]:
         kept: List[Dict[str, Any]] = []
         for pair in pairs:
             scores = self._critique(pair)
             pair["quality"] = scores
-            overall = min(scores.get("groundedness", 0), scores.get("answerability", 0), scores.get("clarity", 0))
-            if overall >= min_quality:
+            if min(scores.get(axis, 0) for axis in QUALITY_AXES) >= min_quality:
                 kept.append(pair)
         return kept
 
     def _critique(self, pair: Dict[str, Any]) -> Dict[str, int]:
+        self._requests += 1
         prompt = (
             "Score this question-answer pair from 1 (poor) to 5 (excellent) on three axes:\n"
             "- groundedness: is the answer fully supported by the passage?\n"
@@ -135,31 +166,71 @@ class QAFactory:
         )
         try:
             obj = self.client.chat_json(prompt, system=_CRITIQUE_SYSTEM, temperature=0.0)
-        except Exception:
-            return {"groundedness": 0, "answerability": 0, "clarity": 0}
-        return {
-            "groundedness": _score(obj, "groundedness"),
-            "answerability": _score(obj, "answerability"),
-            "clarity": _score(obj, "clarity"),
-        }
+        except CassetteMissError:
+            raise
+        except LLMError:
+            # An unparseable or failed critique scores zero: the pair is dropped.
+            return {axis: 0 for axis in QUALITY_AXES}
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            obj = obj[0]
+        if isinstance(obj, dict) and isinstance(obj.get("scores"), dict):
+            obj = obj["scores"]
+        return {axis: _score(obj, axis) for axis in QUALITY_AXES}
+
+
+def question_prompt(chunk: str, n: int) -> str:
+    return (
+        f"Read the passage and write {n} distinct questions that are fully "
+        f"answerable from it alone. Prefer specific, non-trivial questions. "
+        f"Return a JSON array of {n} strings.\n\nPassage:\n{chunk}"
+    )
 
 
 # --------------------------------------------------------------------------
 # config-driven entry point (used by the CLI)
 # --------------------------------------------------------------------------
-def run_qa_task(config: Dict[str, Any], client: Optional[NIMClient] = None) -> List[Dict[str, Any]]:
-    factory = QAFactory(client=client, seed=int(config.get("seed", 11)))
+def _qa_options(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "questions_per_chunk": int(config.get("questions_per_chunk", 2)),
+        "chunk_size": int(config.get("chunk_size", 700)),
+        "overlap": int(config.get("overlap", 100)),
+        "hard_negatives": bool(config.get("hard_negatives", True)),
+        "min_quality": int(config.get("min_quality", 4)),
+        "temperature": float(config.get("temperature", 0.7)),
+    }
+
+
+def run_qa_task(config: Dict[str, Any], client: Optional[Any] = None) -> QAResult:
     docs = _resolve_docs(config.get("docs", []), base_dir=config.get("_base_dir", "."))
     if not docs:
         raise ValueError("The qa task needs at least one document under 'docs'.")
-    return factory.generate(
-        docs=docs,
-        questions_per_chunk=int(config.get("questions_per_chunk", 2)),
-        chunk_size=int(config.get("chunk_size", 700)),
-        overlap=int(config.get("overlap", 100)),
-        hard_negatives=bool(config.get("hard_negatives", True)),
-        min_quality=int(config.get("min_quality", 4)),
-        temperature=float(config.get("temperature", 0.7)),
+    factory = QAFactory(client=client, seed=int(config.get("seed", 11)))
+    return factory.generate(docs=docs, **_qa_options(config))
+
+
+def plan_qa_task(config: Dict[str, Any]):
+    """Count requests and build the first prompt without calling the model."""
+    from .llm import json_system
+    from .text import RequestPlan
+
+    docs = _resolve_docs(config.get("docs", []), base_dir=config.get("_base_dir", "."))
+    if not docs:
+        raise ValueError("The qa task needs at least one document under 'docs'.")
+    opts = _qa_options(config)
+    chunks = [c for d in docs for c in _chunk_text(d["text"], opts["chunk_size"], opts["overlap"])]
+    per_question = 2 + (1 if opts["hard_negatives"] else 0)  # answer + critique (+ hard negative)
+    q = opts["questions_per_chunk"]
+    return RequestPlan(
+        task="qa",
+        chat_requests=len(chunks) * (1 + q * per_question),
+        embed_requests=0,
+        groups={},
+        first_prompt=question_prompt(chunks[0], q) if chunks else "(no text in docs)",
+        first_system=json_system(_QGEN_SYSTEM),
+        notes=[
+            f"{len(docs)} document(s) -> {len(chunks)} chunk(s) of up to {opts['chunk_size']} words",
+            f"upper bound: questions answered NOT_IN_PASSAGE skip their hard-negative and critique calls",
+        ],
     )
 
 
@@ -204,13 +275,18 @@ def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
 
 
 def _is_unanswerable(answer: str) -> bool:
-    return "NOT_IN_PASSAGE" in (answer or "").upper()
+    return "NOT_IN_PASSAGE" in (answer or "").upper().replace(" ", "_")
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
 
 
 def _score(obj: Any, key: str) -> int:
     try:
         if isinstance(obj, dict):
-            return int(round(float(obj.get(key, 0))))
+            value = int(round(float(obj.get(key, 0))))
+            return max(0, min(5, value))
     except (TypeError, ValueError):
         return 0
     return 0

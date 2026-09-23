@@ -32,7 +32,45 @@ def _load_yaml(path: str) -> dict:
     import yaml
 
     with open(path, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+        data = yaml.safe_load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a YAML mapping.")
+    return data
+
+
+def _llm_client(args: argparse.Namespace):
+    """Pick the model client for text/qa: replay (no key), record, or live."""
+    from .llm import RecordingClient, ReplayClient
+
+    if args.record and args.replay:
+        raise ValueError("--record and --replay are mutually exclusive.")
+    if args.replay:
+        return ReplayClient(args.replay)
+    from .nim import NIMClient
+
+    client = NIMClient()  # raises MissingAPIKeyError without a key
+    if args.record:
+        return RecordingClient(client, args.record)
+    return client
+
+
+def _run_llm_command(args: argparse.Namespace, body) -> int:
+    """Shared error handling for text/qa: friendly key message, clear
+    cassette misses, and task-file mistakes without a traceback."""
+    from .llm import CassetteMissError, LLMError
+    from .nim import MissingAPIKeyError
+
+    try:
+        return body()
+    except MissingAPIKeyError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except CassetteMissError as exc:
+        print(f"Replay error: {exc}", file=sys.stderr)
+        return 3
+    except (LLMError, ValueError, KeyError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 # --------------------------------------------------------------------------
@@ -65,39 +103,75 @@ def cmd_generate_tabular(args: argparse.Namespace) -> int:
 
 
 def cmd_generate_text(args: argparse.Namespace) -> int:
-    from .text import run_text_task
+    from .text import plan_text_task, run_text_task
+    from .validate import validate_records
 
-    config = _load_yaml(args.task)
-    records = run_text_task(config)
-    write_jsonl(records, args.out)
-    print(f"Wrote {len(records)} text record(s) to {args.out}")
+    def body() -> int:
+        config = _load_yaml(args.task)
+        if args.dry_run:
+            print(plan_text_task(config).render())
+            return 0
+        client = _llm_client(args)
+        records = run_text_task(config, client=client)
+        write_jsonl(records, args.out)
+        print(f"Wrote {len(records)} text record(s) to {args.out}")
+        _summarize_labels(records)
+        print(f"  requests: {records.requests} chat; dedup: {records.dedup or 'n/a'}")
+        if records.shortfall:
+            short = ", ".join(f"{g}={records.quotas[g] - n}/{records.quotas[g]}"
+                              for g, n in records.shortfall.items())
+            print(f"  WARNING shortfall after top-up rounds (got/quota): {short}")
+        _report_cassette(args, client)
 
-    _summarize_labels(records)
+        if args.chat:
+            to_chat_jsonl(records, args.chat, system=args.chat_system)
+            print(f"Wrote chat-format SFT file to {args.chat}")
+        if args.validate:
+            report = validate_records(list(records), config, kind="text")
+            print("\n" + report.render())
+            if not report.ok:
+                return 1
+        return 0
 
-    if args.chat:
-        to_chat_jsonl(records, args.chat, system=args.chat_system)
-        print(f"Wrote chat-format SFT file to {args.chat}")
-    return 0
+    return _run_llm_command(args, body)
 
 
 def cmd_generate_qa(args: argparse.Namespace) -> int:
-    from .qa import run_qa_task
+    from .qa import plan_qa_task, run_qa_task
+    from .validate import validate_records
 
-    config = _load_yaml(args.task)
-    config["_base_dir"] = os.path.dirname(os.path.abspath(args.task))
-    records = run_qa_task(config)
-    write_jsonl(records, args.out)
-    print(f"Wrote {len(records)} Q&A pair(s) to {args.out}")
+    def body() -> int:
+        config = _load_yaml(args.task)
+        config["_base_dir"] = os.path.dirname(os.path.abspath(args.task))
+        if args.dry_run:
+            print(plan_qa_task(config).render())
+            return 0
+        client = _llm_client(args)
+        records = run_qa_task(config, client=client)
+        write_jsonl(records, args.out)
+        print(f"Wrote {len(records)} Q&A pair(s) to {args.out}")
+        print(
+            f"  {records.chunks} chunk(s), {records.candidates} candidate question(s): "
+            f"{records.duplicates} duplicate, {records.unanswerable} unanswerable, "
+            f"{records.low_quality} below min_quality; {records.requests} chat request(s)"
+        )
+        if records:
+            avg = _avg_quality(records)
+            if avg is not None:
+                print(f"Average quality (min of 3 axes): {avg:.2f}")
+        _report_cassette(args, client)
 
-    if records:
-        avg = _avg_quality(records)
-        if avg is not None:
-            print(f"Average quality (min of 3 axes): {avg:.2f}")
+        if args.chat:
+            to_chat_jsonl(records, args.chat, system=args.chat_system, include_context=args.with_context)
+            print(f"Wrote chat-format SFT file to {args.chat}")
+        if args.validate:
+            report = validate_records(list(records), config, kind="qa")
+            print("\n" + report.render())
+            if not report.ok:
+                return 1
+        return 0
 
-    if args.chat:
-        to_chat_jsonl(records, args.chat, system=args.chat_system, include_context=args.with_context)
-        print(f"Wrote chat-format SFT file to {args.chat}")
-    return 0
+    return _run_llm_command(args, body)
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -127,6 +201,15 @@ def cmd_report(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+def _report_cassette(args: argparse.Namespace, client) -> None:
+    if args.record:
+        print(f"Recorded {client.calls} request(s) to cassette {args.record}")
+    elif args.replay:
+        left = client.remaining()
+        extra = f" ({left} recorded response(s) unused)" if left else ""
+        print(f"Replayed {client.calls} request(s) from cassette {args.replay}{extra}")
+
+
 def _summarize_labels(records) -> None:
     keys = ("label", "sentiment", "category")
     for key in keys:
@@ -153,6 +236,17 @@ def _avg_quality(records):
 # --------------------------------------------------------------------------
 # parser
 # --------------------------------------------------------------------------
+def _add_llm_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--record", metavar="CASSETTE",
+                   help="Record every model request/response to this JSONL cassette.")
+    p.add_argument("--replay", metavar="CASSETTE",
+                   help="Serve responses from a recorded cassette (no key, no network).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print the planned requests and the first prompt; send nothing.")
+    p.add_argument("--validate", action="store_true",
+                   help="Check fields, labels, quotas, duplicates (and QA quality) after generating.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sdf",
@@ -176,19 +270,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_tab.add_argument("--validate", action="store_true", help="Validate after generating.")
     p_tab.set_defaults(func=cmd_generate_tabular)
 
-    p_text = gen_sub.add_parser("text", help="LLM text dataset (needs NVIDIA_API_KEY).")
+    p_text = gen_sub.add_parser(
+        "text", help="LLM text dataset (needs NVIDIA_API_KEY, unless --replay or --dry-run).")
     p_text.add_argument("--task", required=True, help="Path to a text-task YAML file.")
     p_text.add_argument("--out", required=True, help="Output JSONL path.")
     p_text.add_argument("--chat", default=None, help="Also write chat-format SFT JSONL here.")
     p_text.add_argument("--chat-system", default=None, help="System prompt for the chat export.")
+    _add_llm_flags(p_text)
     p_text.set_defaults(func=cmd_generate_text)
 
-    p_qa = gen_sub.add_parser("qa", help="LLM Q&A/instruction pairs (needs NVIDIA_API_KEY).")
+    p_qa = gen_sub.add_parser(
+        "qa", help="LLM Q&A/instruction pairs (needs NVIDIA_API_KEY, unless --replay or --dry-run).")
     p_qa.add_argument("--task", required=True, help="Path to a qa-task YAML file.")
     p_qa.add_argument("--out", required=True, help="Output JSONL path.")
     p_qa.add_argument("--chat", default=None, help="Also write chat-format SFT JSONL here.")
     p_qa.add_argument("--chat-system", default=None, help="System prompt for the chat export.")
     p_qa.add_argument("--with-context", action="store_true", help="Embed the source context in the system turn.")
+    _add_llm_flags(p_qa)
     p_qa.set_defaults(func=cmd_generate_qa)
 
     p_val = sub.add_parser("validate", help="Generate from a schema and validate the result.")
